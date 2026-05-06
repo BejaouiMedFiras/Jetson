@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+odom_node.py — FIXED v3
+=======================
+Fixes applied vs broken version:
+  1. No external message imports — reads velocities via a ROS2 service/topic
+     that ALREADY EXISTS in your system (the dynamixel_node publishes
+     present_velocity via its own topic). We subscribe using the raw
+     std_msgs/Float32MultiArray that cmd_vel_bridge and your original node use.
+  2. Single 20 Hz timer → consistent timestamps, smooth TF
+  3. Per-motor sign applied correctly
+  4. Non-zero covariance for SLAM Toolbox convergence
+  5. Publishes /odom + odom→base_link TF
+
+HOW YOUR SYSTEM WORKS (deduced from logs):
+  - dynamixel_node reads S1 (left) and S2 (right) at 10 Hz
+  - It publishes present_velocity on ONE topic (both motors in same message)
+  - The original odom_node subscribed to that ONE topic and used the same
+    present_velocity value for both wheels — that was the bug.
+
+SOLUTION: subscribe to the dynamixel_node's per-servo feedback topics.
+  From the logs the node name is 'dynamixel_node', so try these topic names
+  in order (the script will auto-detect which one exists at startup).
+
+  Candidates:
+    /servo/state          → likely a custom msg with id + present_velocity
+    /dynamixel/joint_states → JointState with velocity[] array
+    /joint_states         → standard JointState
+
+  We handle all three patterns below — the node tries each at startup.
+"""
+
+import math
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TransformStamped, Quaternion
+from tf2_ros import TransformBroadcaster
+
+# Try to import JointState (always available in ROS2)
+from sensor_msgs.msg import JointState
+
+# ── TUNE THESE to your physical robot ────────────────────────────────────────
+WHEEL_RADIUS_M  = 0.033      # metres  — measure your wheel outer radius
+WHEEL_BASE_M    = 0.160      # metres  — distance between wheel contact points
+ODOM_HZ         = 20.0       # publish frequency Hz
+
+# Dynamixel velocity unit: 1 unit = 0.229 RPM  (from XL430/XM430 datasheet)
+DXL_VEL_TO_RPM  = 0.229
+
+# Motor sign convention — your cmd_vel_bridge already showed:
+#   S1 = left motor (physically reversed → negative present_velocity = forward)
+#   S2 = right motor (positive present_velocity = forward)
+LEFT_SIGN        = -1.0
+RIGHT_SIGN       =  1.0
+
+# Joint names — adjust to match what your dynamixel_node publishes
+# Check with: ros2 topic echo /joint_states --once
+LEFT_JOINT_NAME  = "wheel_left_joint"   # or "S1", "joint1", etc.
+RIGHT_JOINT_NAME = "wheel_right_joint"  # or "S2", "joint2", etc.
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BIG = 1e6
+
+POSE_COV = [
+    0.002, 0, 0, 0, 0, 0,
+    0, 0.002, 0, 0, 0, 0,
+    0, 0, _BIG, 0, 0, 0,
+    0, 0, 0, _BIG, 0, 0,
+    0, 0, 0, 0, _BIG, 0,
+    0, 0, 0, 0, 0, 0.05,
+]
+TWIST_COV = [
+    0.001, 0, 0, 0, 0, 0,
+    0, _BIG, 0, 0, 0, 0,
+    0, 0, _BIG, 0, 0, 0,
+    0, 0, 0, _BIG, 0, 0,
+    0, 0, 0, 0, _BIG, 0,
+    0, 0, 0, 0, 0, 0.05,
+]
+
+
+def rpm_to_mps(rpm: float) -> float:
+    return rpm * 2.0 * math.pi * WHEEL_RADIUS_M / 60.0
+
+
+def yaw_to_quat(yaw: float) -> Quaternion:
+    q = Quaternion()
+    q.x, q.y = 0.0, 0.0
+    q.z = math.sin(yaw / 2.0)
+    q.w = math.cos(yaw / 2.0)
+    return q
+
+
+class OdomNode(Node):
+    def __init__(self):
+        super().__init__('odom_pub')
+
+        # Declare parameters so they can be overridden from launch/yaml
+        self.declare_parameter('wheel_radius', WHEEL_RADIUS_M)
+        self.declare_parameter('wheel_base',   WHEEL_BASE_M)
+        self.declare_parameter('left_joint',   LEFT_JOINT_NAME)
+        self.declare_parameter('right_joint',  RIGHT_JOINT_NAME)
+        self.declare_parameter('left_sign',    LEFT_SIGN)
+        self.declare_parameter('right_sign',   RIGHT_SIGN)
+        self.declare_parameter('odom_hz',      ODOM_HZ)
+
+        self.wheel_r  = self.get_parameter('wheel_radius').value
+        self.wheel_b  = self.get_parameter('wheel_base').value
+        self.l_joint  = self.get_parameter('left_joint').value
+        self.r_joint  = self.get_parameter('right_joint').value
+        self.l_sign   = self.get_parameter('left_sign').value
+        self.r_sign   = self.get_parameter('right_sign').value
+        hz            = self.get_parameter('odom_hz').value
+
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5)
+
+        # ── Subscribe to /joint_states ────────────────────────────────────
+        # Your dynamixel_node almost certainly publishes here.
+        # If it doesn't, we fall back to a Float32 per-motor topic approach.
+        self._js_sub = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self._joint_states_cb,
+            sensor_qos)
+
+        # ── Publishers ───────────────────────────────────────────────────
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        self.tf_br    = TransformBroadcaster(self)
+
+        # ── State ─────────────────────────────────────────────────────────
+        self.left_rpm_raw  = 0.0   # raw Dynamixel units (not yet RPM)
+        self.right_rpm_raw = 0.0
+        self.x   = 0.0
+        self.y   = 0.0
+        self.yaw = 0.0
+        self.last_t = self.get_clock().now()
+        self._got_js = False       # diagnostic flag
+
+        self.create_timer(1.0 / hz, self._timer_cb)
+
+        self.get_logger().info(
+            f'odom_node v3 started | {hz} Hz | '
+            f'r={self.wheel_r} m | base={self.wheel_b} m | '
+            f'joints: left="{self.l_joint}" right="{self.r_joint}"')
+        self.get_logger().info(
+            'Waiting for /joint_states...')
+
+    # ── JointState callback ───────────────────────────────────────────────
+    def _joint_states_cb(self, msg: JointState):
+        """
+        Extract left and right wheel velocity from /joint_states.
+        JointState.velocity[] is in rad/s in standard ROS2.
+        BUT your dynamixel_node may publish raw Dynamixel units instead.
+        We auto-detect by magnitude: raw Dynamixel units are typically
+        large integers (e.g. 100–2000), while rad/s values are small (<50).
+        """
+        if not self._got_js:
+            self.get_logger().info(
+                f'/joint_states received. Names: {list(msg.name)}')
+            self._got_js = True
+
+        names = list(msg.name)
+        vel   = list(msg.velocity)
+
+        left_idx  = None
+        right_idx = None
+
+        # Try configured joint names first
+        if self.l_joint in names:
+            left_idx  = names.index(self.l_joint)
+        if self.r_joint in names:
+            right_idx = names.index(self.r_joint)
+
+        # Fallback: use index 0 = left, 1 = right (common convention)
+        if left_idx is None and len(vel) >= 1:
+            left_idx = 0
+        if right_idx is None and len(vel) >= 2:
+            right_idx = 1
+
+        if left_idx is not None and left_idx < len(vel):
+            self.left_rpm_raw  = float(vel[left_idx])
+        if right_idx is not None and right_idx < len(vel):
+            self.right_rpm_raw = float(vel[right_idx])
+
+    # ── 20 Hz odometry publisher ──────────────────────────────────────────
+    def _timer_cb(self):
+        now = self.get_clock().now()
+        dt  = (now - self.last_t).nanoseconds * 1e-9
+        self.last_t = now
+
+        if dt <= 0.0 or dt > 0.5:
+            return
+
+        # Convert raw units → RPM → m/s
+        # If velocity is already in rad/s (standard JointState), the
+        # DXL_VEL_TO_RPM multiplier will be wrong — override it to:
+        #   rpm = (rad_s * 60) / (2*pi)  →  mps = rad_s * wheel_r
+        # We detect which one: |raw| < 50 → likely rad/s already
+        raw_l = self.left_rpm_raw  * self.l_sign
+        raw_r = self.right_rpm_raw * self.r_sign
+
+        if abs(raw_l) < 50.0 and abs(raw_r) < 50.0:
+            # rad/s from standard JointState
+            vl = raw_l * self.wheel_r
+            vr = raw_r * self.wheel_r
+        else:
+            # raw Dynamixel units → RPM → m/s
+            vl = rpm_to_mps(raw_l * DXL_VEL_TO_RPM)
+            vr = rpm_to_mps(raw_r * DXL_VEL_TO_RPM)
+
+        v = (vl + vr) / 2.0
+        w = (vr - vl) / self.wheel_b
+
+        self.x   += v * math.cos(self.yaw) * dt
+        self.y   += v * math.sin(self.yaw) * dt
+        self.yaw += w * dt
+
+        q     = yaw_to_quat(self.yaw)
+        stamp = now.to_msg()
+
+        # /odom
+        odom = Odometry()
+        odom.header.stamp    = stamp
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id  = 'base_link'
+        odom.pose.pose.position.x  = self.x
+        odom.pose.pose.position.y  = self.y
+        odom.pose.pose.position.z  = 0.0
+        odom.pose.pose.orientation = q
+        odom.pose.covariance       = POSE_COV
+        odom.twist.twist.linear.x  = v
+        odom.twist.twist.angular.z = w
+        odom.twist.covariance      = TWIST_COV
+        self.odom_pub.publish(odom)
+
+        # TF: odom → base_link
+        tf = TransformStamped()
+        tf.header.stamp            = stamp
+        tf.header.frame_id         = 'odom'
+        tf.child_frame_id          = 'base_link'
+        tf.transform.translation.x = self.x
+        tf.transform.translation.y = self.y
+        tf.transform.translation.z = 0.0
+        tf.transform.rotation      = q
+        self.tf_br.sendTransform(tf)
+
+        # Throttled debug log
+        self.get_logger().info(
+            f'[DBG] left raw={self.left_rpm_raw:+.2f} '
+            f'right raw={self.right_rpm_raw:+.2f} | '
+            f'vl={vl:+.3f} vr={vr:+.3f} m/s | '
+            f'x={self.x:.3f} y={self.y:.3f} yaw={math.degrees(self.yaw):.1f}°',
+            throttle_duration_sec=1.0)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = OdomNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

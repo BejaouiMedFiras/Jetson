@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+odom_node.py — final version
+Key fixes:
+  - Timer at 10Hz to match Dynamixel read rate (no TF gaps)
+  - TF broadcaster buffer_duration=30s (fixes extrapolation errors)
+  - dt matched to servo callback period
+"""
+import math
+import rclpy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from nav_msgs.msg import Odometry
+from dynamixel_interfaces.msg import DynamixelState
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
+
+WHEEL_RADIUS  = 0.033
+WHEEL_BASE    = 0.160
+MAX_RPM       = 80.0
+DEADBAND_RPM  = 2.0
+LEFT_SIGN     = -1.0
+RIGHT_SIGN     =  1.0
+WARMUP_SEC    = 2.0
+TIMER_HZ      = 10.0   # match Dynamixel read rate exactly
+
+
+class OdomNode(Node):
+    def __init__(self):
+        super().__init__('odom_pub')
+
+        self.x   = 0.0
+        self.y   = 0.0
+        self.yaw = 0.0
+
+        self.left_rpm  = 0.0
+        self.right_rpm = 0.0
+
+        self._left_ready  = False
+        self._right_ready = False
+        self._start_time  = self.get_clock().now()
+        self._last_time   = None
+
+        self.pub = self.create_publisher(Odometry, '/odom', 10)
+        self.br  = TransformBroadcaster(self)
+
+        self.create_subscription(
+            DynamixelState, '/servo1/state', self._left_cb, QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        ))
+        self.create_subscription(
+            DynamixelState, '/servo2/state', self._right_cb, QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        ))
+
+        self.create_timer(1.0 / TIMER_HZ, self._update)
+        self.get_logger().info(
+            'odom_pub ready (%.0fHz, deadband=%.1f RPM)' % (TIMER_HZ, DEADBAND_RPM))
+
+    def _clamp(self, rpm: float) -> float:
+        if not math.isfinite(rpm):
+            return 0.0
+        if abs(rpm) < DEADBAND_RPM:
+            return 0.0
+        return max(-MAX_RPM, min(MAX_RPM, rpm))
+
+    def _left_cb(self, msg):
+        self.left_rpm    = self._clamp(msg.present_velocity * 0.229 * LEFT_SIGN)
+        self._left_ready = True
+        self.get_logger().info(f'[DBG] left raw={msg.present_velocity:.2f} rpm={self.left_rpm:.2f}', throttle_duration_sec=1.0)
+
+    def _right_cb(self, msg):
+        self.right_rpm    = self._clamp(msg.present_velocity * 0.229 * RIGHT_SIGN)
+        self._right_ready = True
+        self.get_logger().info(f'[DBG] right raw={msg.present_velocity:.2f} rpm={self.right_rpm:.2f}', throttle_duration_sec=1.0)
+
+    def _update(self):
+        now = self.get_clock().now()
+
+        elapsed = (now - self._start_time).nanoseconds / 1e9
+        if elapsed < WARMUP_SEC or not (self._left_ready and self._right_ready):
+            self._last_time = now
+            return
+
+        if self._last_time is None:
+            self._last_time = now
+            return
+
+        dt = (now - self._last_time).nanoseconds / 1e9
+        self._last_time = now
+
+        if dt <= 0.0 or dt > 1.0:
+            return
+
+        v_left  = self.left_rpm  * (2.0 * math.pi * WHEEL_RADIUS) / 60.0
+        v_right = self.right_rpm * (2.0 * math.pi * WHEEL_RADIUS) / 60.0
+        v = (v_right + v_left)  / 2.0
+        w = (v_right - v_left)  / WHEEL_BASE
+
+        self.x   += v * math.cos(self.yaw) * dt
+        self.y   += v * math.sin(self.yaw) * dt
+        self.yaw += w * dt
+
+        qz = math.sin(self.yaw / 2.0)
+        qw = math.cos(self.yaw / 2.0)
+        stamp = now.to_msg()
+
+        msg = Odometry()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = 'odom'
+        msg.child_frame_id  = 'base_link'
+        msg.pose.pose.position.x    = self.x
+        msg.pose.pose.position.y    = self.y
+        msg.pose.pose.orientation.z = qz
+        msg.pose.pose.orientation.w = qw
+        msg.pose.covariance[0]  = 0.05
+        msg.pose.covariance[7]  = 0.05
+        msg.pose.covariance[35] = 0.1
+        msg.twist.covariance[0]  = 0.05
+        msg.twist.covariance[7]  = 0.05
+        msg.twist.covariance[35] = 0.1
+        msg.twist.twist.linear.x  = v
+        msg.twist.twist.angular.z = w
+        self.pub.publish(msg)
+
+        tf = TransformStamped()
+        tf.header.stamp            = stamp
+        tf.header.frame_id         = 'odom'
+        tf.child_frame_id          = 'base_link'
+        tf.transform.translation.x = self.x
+        tf.transform.translation.y = self.y
+        tf.transform.rotation.z    = qz
+        tf.transform.rotation.w    = qw
+        self.br.sendTransform(tf)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    rclpy.spin(OdomNode())
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

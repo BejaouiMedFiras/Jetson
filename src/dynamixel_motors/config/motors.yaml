@@ -1,0 +1,6 @@
+dynamixel_node:
+  ros__parameters:
+    port: /dev/ttyUSB0
+    baud_rate: 115200
+    servo_ids: [1, 2]
+    read_hz: 10.0

@@ -1,0 +1,157 @@
+<?xml version="1.0" ?>
+<robot name="lgdxrobot2" version="1.0">
+  <joint name="base_footprint_joint" type="fixed">
+    <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+    <parent link="base_link"/>
+    <child link="base_footprint"/>
+  </joint>
+  <joint name="camera_link_joint" type="fixed">
+    <origin rpy="0.00000 0.00000 0.00000" xyz="0.13104 0.01776 0.07181"/>
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+  </joint>
+  <joint name="imu_link_joint" type="fixed">
+    <origin rpy="0.00000 0.00000 0.00000" xyz="-0.08351 0.00000 0.0649"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+  <joint name="lidar_link_joint" type="fixed">
+    <origin rpy="0.00000 0.00000 -3.14159" xyz="0.06000 -0.00000 0.15641"/>
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+  </joint>
+  <!-- Roue gauche (côté y positif) — moteur 0 -->
+  <joint name="wheel_left_joint" type="continuous">
+    <limit effort="30.0" velocity="12.0"/>
+    <origin rpy="-1.57080 0.00000 0.00000" xyz="0.00000 0.10357 0.03681"/>
+    <parent link="base_link"/>
+    <child link="wheel_left_link"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <!-- Roue droite (côté y négatif) — moteur 1 -->
+  <joint name="wheel_right_joint" type="continuous">
+    <limit effort="30.0" velocity="12.0"/>
+    <origin rpy="-1.57080 0.00000 0.00000" xyz="0.00000 -0.10357 0.03681"/>
+    <parent link="base_link"/>
+    <child link="wheel_right_link"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <!-- Roue folle avant (passive, remplace wheel1/wheel2) -->
+  <joint name="caster_front_joint" type="fixed">
+    <origin rpy="0.00000 0.00000 0.00000" xyz="0.08200 0.00000 0.03681"/>
+    <parent link="base_link"/>
+    <child link="caster_front_link"/>
+  </joint>
+
+  <!-- Roue folle arrière (passive, remplace wheel3/wheel4) -->
+  <joint name="caster_back_joint" type="fixed">
+    <origin rpy="0.00000 0.00000 0.00000" xyz="-0.08200 0.00000 0.03681"/>
+    <parent link="base_link"/>
+    <child link="caster_back_link"/>
+  </joint>
+  <link name="base_link">
+    <visual name="board">
+      <material name="lgdxrobot_green"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_LGDXRobot2_Board_001_.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+    <visual name="brackets">
+      <material name="lgdxrobot_black"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Mounting_Bracket_001_001.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+    <visual name="motors">
+      <material name="lgdxrobot_sliver"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Motor_001_001.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+    <visual name="plates">
+      <material name="lgdxrobot_red"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Top_Plate_001_.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+    <visual name="screws">
+      <material name="lgdxrobot_sliver"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_M4_Nut_001_021.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+    <visual name="standoffs">
+      <material name="lgdxrobot_sliver"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Coupling_Nut_70mm_001_006.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="base_footprint"/>
+  <link name="camera_link">
+    <visual name="camera">
+      <material name="lgdxrobot_sliver"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="-0.02304 -0.01750 -0.01250"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Camera_001_.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="imu_link"/>
+  <link name="lidar_link">
+    <visual name="lidar">
+      <material name="lgdxrobot_black"/>
+      <origin rpy="0.00000 0.00000 0.00000" xyz="0.00000 -0.00000 -0.02310"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Lidar_001_.dae" scale="1.00000 1.00000 1.00000"/>
+      </geometry>
+    </visual>
+  </link>
+  <!-- Roue gauche — avec le mesh de wheel1 (côté gauche) -->
+  <link name="wheel_left_link">
+    <visual name="wheel_left">
+      <material name="lgdxrobot_black"/>
+      <origin rpy="1.57080 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Wheel_1_001_.dae" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <!-- Roue droite — avec le mesh de wheel2 (côté droit) -->
+  <link name="wheel_right_link">
+    <visual name="wheel_right">
+      <material name="lgdxrobot_black"/>
+      <origin rpy="1.57080 0.00000 0.00000" xyz="0.00000 0.00000 0.00000"/>
+      <geometry>
+        <mesh filename="package://lgdxrobot2_description/meshes/dae/b_Wheel_2_001_.dae" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <!-- Roue folle avant (sphère simple, pas de mesh) -->
+  <link name="caster_front_link"/>
+
+  <!-- Roue folle arrière -->
+  <link name="caster_back_link"/>
+  <material name="lgdxrobot_black">
+    <color rgba="0.00000 0.00000 0.00000 1.00000"/>
+  </material>
+  <material name="lgdxrobot_green">
+    <color rgba="0.00000 0.25882 0.06667 1.00000"/>
+  </material>
+  <material name="lgdxrobot_red">
+    <color rgba="0.21961 0.00784 0.01176 1.00000"/>
+  </material>
+  <material name="lgdxrobot_sliver">
+    <color rgba="0.52549 0.52549 0.52549 1.00000"/>
+  </material>
+</robot>

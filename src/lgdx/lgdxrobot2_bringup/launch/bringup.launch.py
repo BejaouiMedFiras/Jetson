@@ -1,0 +1,100 @@
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import IncludeLaunchDescription
+from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
+import os
+
+launch_args = [
+# Ajouter dans launch_args
+    DeclareLaunchArgument(
+        name='wheel_base',
+        default_value='0.25',
+        description='Distance entre les deux roues en mètres (entraxe).'
+    ),
+
+    DeclareLaunchArgument(
+        name='serial_port_name', 
+        default_value='/dev/lgdxrobot2', 
+        description='Serial port name for the LGDXRobot2 or default to /dev/lgdxrobot2.'
+    ),
+    DeclareLaunchArgument(
+        name='use_joy', 
+        default_value='True', 
+        description='Whether to enable the joy.'
+    ),
+    DeclareLaunchArgument(
+        name='use_lidar', 
+        default_value='True', 
+        description='Whether to enable the LiDAR.'
+    ),
+    DeclareLaunchArgument(
+        name='lidar_model', 
+        default_value='a1', 
+        description='RPLIDAR model name.'
+    ),
+    DeclareLaunchArgument(
+        name='use_rviz', 
+        default_value='False', 
+        description='Visualize in RViz.'
+    ),
+]
+
+def launch_setup(context):
+    wheel_base = LaunchConfiguration('wheel_base')
+    use_joy = LaunchConfiguration('use_joy')
+    use_lidar = LaunchConfiguration('use_lidar')
+    lidar_model = LaunchConfiguration('lidar_model').perform(context)
+    use_rviz = LaunchConfiguration('use_rviz')
+    
+    description_pkg_share = get_package_share_directory('lgdxrobot2_description')
+    lidar_pkg_share = get_package_share_directory('sllidar_ros2')
+    serial_port_name = LaunchConfiguration('serial_port_name')
+    
+    description_node = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(description_pkg_share, 'launch', 'display.launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': 'False',
+            'use_joint_state_publisher': 'False',
+            'use_rviz': use_rviz,
+        }.items(),
+    )
+    lgdxrobot2_agent_node = Node(
+        package='lgdxrobot2_agent',
+        executable='lgdxrobot2_agent_node',
+        output='screen',
+        parameters=[{
+            'serial_port_name': serial_port_name,
+            'reset_transform': True,
+            'use_joy': True,
+            'publish_tf': True,
+            'wheel_base': wheel_base,
+        }]
+    )
+    joy_node = Node(
+        package='joy',
+        executable='joy_node',
+        output='screen',
+        condition=IfCondition(use_joy),
+    )
+    lidar_node = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(lidar_pkg_share, 'launch', 'sllidar_' + lidar_model + '_launch.py')
+        ),
+        condition=IfCondition(use_lidar),
+        launch_arguments={
+            'frame_id': 'lidar_link'
+        }.items(),
+    )
+    return [description_node, lgdxrobot2_agent_node, joy_node, lidar_node]
+    
+def generate_launch_description():
+    opfunc = OpaqueFunction(function = launch_setup)
+    ld = LaunchDescription(launch_args)
+    ld.add_action(opfunc)
+    return ld

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>dynamixel_motors</name>
+  <version>1.0.0</version>
+  <description>
+    Nœud ROS2 de contrôle de servos Dynamixel via Protocol 2.0.
+    Équivalent du système master_rs485 / motor_node pour les Dynamixel.
+    Supporte: contrôle vitesse, position, position+courant, PWM.
+    Fonctions: BulkRead périodique, SyncWrite multi-servos, KeepAlive.
+  </description>
+
+  <maintainer email="vous@example.com">Votre Nom</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Dépendances ROS2 -->
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>builtin_interfaces</depend>
+
+  <!-- Messages custom -->
+  <depend>dynamixel_interfaces</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
