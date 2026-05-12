@@ -1,57 +1,63 @@
 #!/usr/bin/env python3
 # ============================================
-# DYNAMIXEL DRIVER v2.5 — ESP32 daisy-chain / Python 3.6+
+# DYNAMIXEL DRIVER v3.0 — ESP32 daisy-chain / Python 3.6+
 #
-# CORRECTIONS v2.5 — corrections des bugs critiques identifiés
-#   dans les logs de débogage:
+# v3.0 vs v2.5 — CORRECTIONS CRITIQUES :
 #
-#   [FIX CRIT-1] Suppression de GroupBulkRead → retour lectures
-#       séquentielles individuelles
+#   [FIX CT-1] Table CT corrigée pour correspondre au firmware ESP32
+#       AVANT (v2.5 — FAUX) :
+#         PROFILE_ACCELERATION = 108   ← ESP32 a CT_GOAL_VEL_B ici !
+#         PROFILE_VELOCITY     = 112
+#         PRESENT_POSITION     = 132   ← ESP32 a CT_NOW_VEL_B ici !
 #
-#       PROBLÈME: GroupBulkRead.txRxPacket() attend les réponses de
-#       TOUS les servos dans la même fenêtre temporelle. Avec deux
-#       ESP32 daisy-chained sur RS485 qui répondent séquentiellement
-#       (délai firmware: 500µs + mpos×4000µs), le SDK timeout avant
-#       d'avoir reçu la réponse du second ESP32.
-#       Symptôme: "BulkRead ERREUR: There is no status packet!" même
-#       quand le PING fonctionne.
+#       APRÈS (v3.0 — CORRECT, correspondance firmware ESP32 v5.x) :
+#         GOAL_VELOCITY_B      = 108   moteur B (arrière)
+#         PROFILE_VELOCITY     = 112
+#         PRESENT_VELOCITY_B   = 132   moteur B (arrière)
 #
-#       SOLUTION: lecture séquentielle readTxRx() individuelle par servo,
-#       avec seulement 20ms entre les deux lectures (pas 150ms).
-#       Latence totale: ~25ms pour 2 servos → feedback à 25Hz réel.
+#       CONSÉQUENCES du bug v2.5 :
+#         • set_profile(accel=800) → écrivait 800 rpm dans moteur B !
+#         • PRESENT_POSITION lu = vitesse moteur B en RPM (incompréhensible)
+#         • Moteur B ne recevait jamais de vraie commande de vitesse
 #
-#   [FIX CRIT-2] Mode commandé tracké séparément de l'état lu
+#   [FIX CT-2] PROFILE_ACCELERATION supprimé
+#       L'ESP32 custom n'a PAS de registre profile_acceleration.
+#       Il gère l'accélération en interne (RAMP_RPM_S = 800 dans le firmware).
+#       set_profile() n'envoie plus que PROFILE_VELOCITY (registre 112).
 #
-#       PROBLÈME: si les lectures échouent (état non mis à jour),
-#       servo.state.operating_mode reste à la valeur initiale (3 =
-#       POSITION). Le nœud ROS2 compare "mode demandé (1)" vs "mode
-#       lu (3 figé)" → détecte un changement à chaque callback →
-#       envoie set_mode() à 3Hz → sature le bus → les lectures
-#       continuent d'échouer → boucle infinie.
-#       Symptôme dans les logs: "S1 changement de mode 3 → 1" répété
-#       toutes les 270ms indéfiniment.
+#   [4M-1] goal_velocity_b() — nouveau
+#       Écrit CT_GOAL_VEL_B (108) pour contrôler le moteur B (arrière).
 #
-#       SOLUTION: ServoState.commanded_mode = mode effectivement envoyé
-#       au servo (indépendant de ce qui est lu). Le nœud compare
-#       mode_demandé vs commanded_mode (pas vs present_mode).
-#       set_mode() met à jour commanded_mode immédiatement même si
-#       la confirmation n'est pas lue en retour.
+#   [4M-2] present_velocity_b dans ServoState
+#       update_from_raw() lit CT_NOW_VEL_B (132) → present_velocity_b.
 #
-#   [FIX CRIT-3] Bus mutex étendu à toutes les opérations série
+#   [4M-3] velocity_b() dans Servo
+#       Façade pour goal_velocity_b().
 #
-#       PROBLÈME: la boucle de lecture tourne dans un thread daemon
-#       sans prendre le lock pendant le delayMicroseconds entre
-#       servos, laissant une fenêtre où un write() peut interrompre
-#       une transaction de lecture en cours.
+#   [4M-4] KeepAlive envoie aussi goal_velocity_b
+#       Pour éviter le timeout ESP32 sur le moteur B.
 #
-#       SOLUTION: le lock est maintenu pour TOUTE la séquence de
-#       lecture multi-servo (pas relâché entre les deux reads).
-#       Les writes attendent que la séquence de lecture soit terminée.
+#   Conservés de v2.5 :
+#   [FIX CRIT-1] Lectures séquentielles (pas GroupBulkRead)
+#   [FIX CRIT-2] commanded_mode tracké séparément
+#   [FIX CRIT-3] Bus mutex étendu à toute la séquence
+#   [FIX CRIT-4] Timeout 2.0s
 #
-#   [FIX CRIT-4] Timeout ServoState réduit à 2.0s
-#       À 25Hz, 2s = 50 paquets perdus consécutifs. En dessous on
-#       ne déclare pas un servo mort trop vite.
-#
+# Registres ESP32 v5.x (référence firmware) :
+#   100: GOAL_PWM          int16
+#   102: GOAL_CURRENT      int16
+#   104: GOAL_VELOCITY     int32  moteur A (avant)
+#   108: GOAL_VELOCITY_B   int32  moteur B (arrière)  ← était PROFILE_ACCEL
+#   112: PROFILE_VELOCITY  int32
+#   116: GOAL_POSITION     int32
+#   124: PRESENT_PWM       int16
+#   126: PRESENT_CURRENT   int16
+#   128: PRESENT_VELOCITY  int32  moteur A (avant)
+#   132: PRESENT_VELOCITY_B int32 moteur B (arrière)  ← était PRESENT_POSITION
+#   144: PRESENT_VOLTAGE   int16
+#   146: PRESENT_TEMPERATURE uint8
+#   156: VEL_ZONE          uint8  (v1.9+)
+#   157: STALL_FLAG        uint8  (v1.9+)
 # ============================================
 
 import time
@@ -75,26 +81,27 @@ except ImportError:
 
 
 # ════════════════════════════════════════════
-# REGISTRES CONTROL TABLE (ESP32 v1.9)
+# REGISTRES CONTROL TABLE — ESP32 v5.x
+# [FIX CT-1] Corrigés pour correspondre au firmware ESP32 réel
 # ════════════════════════════════════════════
 class CT:
     OPERATING_MODE          = 11
     TORQUE_ENABLE           = 64
     HARDWARE_ERROR_STATUS   = 70
-    GOAL_PWM                = 100
-    GOAL_CURRENT            = 102
-    GOAL_VELOCITY           = 104
-    PROFILE_ACCELERATION    = 108
-    PROFILE_VELOCITY        = 112
-    GOAL_POSITION           = 116
-    PRESENT_PWM             = 124
-    PRESENT_CURRENT         = 126
-    PRESENT_VELOCITY        = 128
-    PRESENT_POSITION        = 132
-    PRESENT_VOLTAGE         = 144
-    PRESENT_TEMPERATURE     = 146
-    VEL_ZONE                = 156   # [v1.9] Zone PID (0/1/2), lecture seule
-    STALL_FLAG              = 157   # [v1.9] Calage détecté (0/1), lecture seule
+    GOAL_PWM                = 100   # int16
+    GOAL_CURRENT            = 102   # int16
+    GOAL_VELOCITY           = 104   # int32 — moteur A (avant)
+    GOAL_VELOCITY_B         = 108   # int32 — moteur B (arrière)  [FIX CT-1]
+    PROFILE_VELOCITY        = 112   # int32
+    GOAL_POSITION           = 116   # int32
+    PRESENT_PWM             = 124   # int16
+    PRESENT_CURRENT         = 126   # int16
+    PRESENT_VELOCITY        = 128   # int32 — moteur A (avant)
+    PRESENT_VELOCITY_B      = 132   # int32 — moteur B (arrière)  [FIX CT-1]
+    PRESENT_VOLTAGE         = 144   # int16
+    PRESENT_TEMPERATURE     = 146   # uint8
+    VEL_ZONE                = 156   # uint8 (v1.9+)
+    STALL_FLAG              = 157   # uint8 (v1.9+)
 
 
 # ════════════════════════════════════════════
@@ -109,14 +116,14 @@ class Mode:
 
 
 # ════════════════════════════════════════════
-# CONVERSIONS UNITÉS DYNAMIXEL (X-series)
+# CONVERSIONS UNITÉS — ESP32 custom firmware
 # ════════════════════════════════════════════
 class Conv:
     POS_UNIT  = 360.0 / 4096.0   # deg/LSB
-    VEL_UNIT  = 0.229              # rpm/LSB
-    CUR_UNIT  = 2.69               # mA/LSB
-    PWM_UNIT  = 0.113              # %/LSB
-    VOLT_UNIT = 0.1                # V/LSB
+    VEL_UNIT  = 0.229             # rpm/LSB
+    CUR_UNIT  = 2.69              # mA/LSB
+    PWM_UNIT  = 0.113             # %/LSB
+    VOLT_UNIT = 0.1               # V/LSB
 
     @staticmethod
     def deg_to_pos(d: float) -> int:
@@ -156,13 +163,14 @@ class Conv:
 
 
 # ════════════════════════════════════════════
-# PLAGE DE LECTURE COMMUNE
+# PLAGE DE LECTURE
+# READ_START=64, READ_END=157 → 94 octets
+# Couvre : TORQUE_ENABLE(64) → STALL_FLAG(157)
+# Inclut : PRESENT_VELOCITY(128) ET PRESENT_VELOCITY_B(132)
 # ════════════════════════════════════════════
-# On lit depuis CT_TORQUE_ENABLE (64) jusqu'à CT_STALL_FLAG (157).
-# Un seul readTxRx() de 94 octets couvre tous les registres utiles.
-READ_START = CT.TORQUE_ENABLE         # 64
-READ_END   = CT.STALL_FLAG           # 157
-READ_LEN   = READ_END - READ_START + 1  # 94 octets
+READ_START = CT.TORQUE_ENABLE          # 64
+READ_END   = CT.STALL_FLAG             # 157
+READ_LEN   = READ_END - READ_START + 1 # 94 octets
 
 HISTORY_SIZE = 50
 
@@ -187,85 +195,89 @@ def _extract(raw: bytes, base: int, addr: int, ln: int) -> Optional[int]:
 
 
 # ════════════════════════════════════════════
-# ÉTAT D'UN SERVO
+# ÉTAT D'UN SERVO — 4 MOTEURS (A=avant, B=arrière)
 # ════════════════════════════════════════════
 @dataclass
 class ServoState:
     servo_id: int
 
-    # [FIX CRIT-2] Mode commandé (ce qu'on a ENVOYÉ) vs mode présent (ce qu'on LIT)
-    # La comparaison pour les changements de mode doit utiliser commanded_mode,
-    # pas operating_mode (qui peut rester figé si les lectures échouent).
-    commanded_mode:  int   = Mode.POSITION    # Mode envoyé au servo
-    operating_mode:  int   = Mode.POSITION    # Mode lu (peut être obsolète)
-    torque_enabled:  bool  = False
-    torque_commanded: bool = False             # Torque qu'on a commandé
+    # [FIX CRIT-2] Mode commandé vs mode lu
+    commanded_mode:   int  = Mode.VELOCITY
+    operating_mode:   int  = Mode.VELOCITY
+    torque_enabled:   bool = False
+    torque_commanded: bool = False
 
-    present_position:    float = 0.0
-    present_velocity:    float = 0.0   # RPM
+    # ── Moteur A (avant) ──────────────────────────────────────────────
+    present_velocity:    float = 0.0   # rpm — CT_NOW_VEL  (128)
     present_current:     float = 0.0   # mA
     present_pwm:         float = 0.0   # %
     present_voltage:     float = 0.0   # V
     present_temperature: int   = 0
+    present_position:    float = 0.0   # deg (si mode position)
 
-    goal_position:       float = 0.0
-    goal_velocity:       float = 0.0
-    goal_current:        float = 0.0
-    goal_pwm:            float = 0.0
+    # ── Moteur B (arrière) ────────────────────────────────────────────
+    present_velocity_b:  float = 0.0   # rpm — CT_NOW_VEL_B (132)  [4M-2]
+    present_current_b:   float = 0.0   # mA  (futur ACS712 moteur B)
 
-    profile_velocity:     float = 0.0
-    profile_acceleration: float = 0.0
+    # ── Consignes ─────────────────────────────────────────────────────
+    goal_velocity:    float = 0.0   # rpm moteur A
+    goal_velocity_b:  float = 0.0   # rpm moteur B  [4M-1]
+    goal_position:    float = 0.0
+    goal_current:     float = 0.0
+    goal_pwm:         float = 0.0
+    profile_velocity: float = 0.0   # [FIX CT-2] plus de profile_acceleration
 
+    # ── Diagnostics ───────────────────────────────────────────────────
     hardware_error: int  = 0
     vel_zone:       int  = 1
     stall_flag:     bool = False
 
-    # Statistiques
-    last_seen:    float = 0.0
-    push_count:   int   = 0
-    push_rate:    float = 0.0
-    read_errors:  int   = 0
+    # ── Statistiques ──────────────────────────────────────────────────
+    last_seen:   float = 0.0
+    push_count:  int   = 0
+    push_rate:   float = 0.0
+    read_errors: int   = 0
 
-    hist_current:  List[float] = field(default_factory=lambda: [0.0] * HISTORY_SIZE)
-    hist_velocity: List[float] = field(default_factory=lambda: [0.0] * HISTORY_SIZE)
+    hist_current:    List[float] = field(default_factory=lambda: [0.0] * HISTORY_SIZE)
+    hist_velocity:   List[float] = field(default_factory=lambda: [0.0] * HISTORY_SIZE)
+    hist_velocity_b: List[float] = field(default_factory=lambda: [0.0] * HISTORY_SIZE)
 
     _rate_t: float = field(default_factory=time.time, repr=False)
     _rate_n: int   = field(default=0, repr=False)
 
-    # [FIX CRIT-4] Timeout 2.0s (pas 1.0s ni 0.5s)
-    TIMEOUT_S: float = 2.0
+    TIMEOUT_S: float = 2.0   # [FIX CRIT-4]
 
     def update_from_raw(self, raw: bytes):
         def g(a, l): return _extract(raw, READ_START, a, l)
 
-        te  = g(CT.TORQUE_ENABLE,         1)
-        hw  = g(CT.HARDWARE_ERROR_STATUS,  1)
-        pwm = g(CT.PRESENT_PWM,           2)
-        cur = g(CT.PRESENT_CURRENT,       2)
-        vel = g(CT.PRESENT_VELOCITY,      4)
-        pos = g(CT.PRESENT_POSITION,      4)
-        vlt = g(CT.PRESENT_VOLTAGE,       2)
-        tmp = g(CT.PRESENT_TEMPERATURE,   1)
-        vzn = g(CT.VEL_ZONE,              1)
-        stl = g(CT.STALL_FLAG,            1)
+        te   = g(CT.TORQUE_ENABLE,         1)
+        hw   = g(CT.HARDWARE_ERROR_STATUS,  1)
+        pwm  = g(CT.PRESENT_PWM,           2)
+        cur  = g(CT.PRESENT_CURRENT,       2)
+        vel  = g(CT.PRESENT_VELOCITY,      4)   # moteur A (128)
+        velb = g(CT.PRESENT_VELOCITY_B,    4)   # moteur B (132) [FIX CT-1]
+        vlt  = g(CT.PRESENT_VOLTAGE,       2)
+        tmp  = g(CT.PRESENT_TEMPERATURE,   1)
+        vzn  = g(CT.VEL_ZONE,              1)
+        stl  = g(CT.STALL_FLAG,            1)
 
-        if te  is not None: self.torque_enabled      = bool(te)
-        if hw  is not None: self.hardware_error      = hw
-        if pwm is not None: self.present_pwm         = Conv.pwm_to_pct(_u2s16(pwm))
-        if cur is not None: self.present_current     = Conv.cur_to_ma(_u2s16(cur))
-        if vel is not None: self.present_velocity    = Conv.vel_to_rpm(_u2s32(vel))
-        if pos is not None: self.present_position    = Conv.pos_to_deg(_u2s32(pos))
-        if vlt is not None: self.present_voltage     = vlt * Conv.VOLT_UNIT
-        if tmp is not None: self.present_temperature = tmp
-        if vzn is not None: self.vel_zone            = vzn
-        if stl is not None: self.stall_flag          = bool(stl)
-        # Note: on ne met PAS à jour operating_mode depuis la lecture,
-        # car le registre CT_OPERATING_MODE (11) est en dehors de READ_START (64).
-        # On fait confiance à commanded_mode pour la logique de contrôle.
+        if te   is not None: self.torque_enabled     = bool(te)
+        if hw   is not None: self.hardware_error     = hw
+        if pwm  is not None: self.present_pwm        = Conv.pwm_to_pct(_u2s16(pwm))
+        if cur  is not None: self.present_current    = Conv.cur_to_ma(_u2s16(cur))
+        if vel  is not None: self.present_velocity   = Conv.vel_to_rpm(_u2s32(vel))
+        if velb is not None: self.present_velocity_b = Conv.vel_to_rpm(_u2s32(velb))  # [4M-2]
+        if vlt  is not None: self.present_voltage    = vlt * Conv.VOLT_UNIT
+        if tmp  is not None: self.present_temperature = tmp
+        if vzn  is not None: self.vel_zone           = vzn
+        if stl  is not None: self.stall_flag         = bool(stl)
+
+        # [FIX CRIT-2] Ne PAS mettre à jour operating_mode depuis la lecture
+        # (CT_OPERATING_MODE=11 est hors de notre plage de lecture 64-157)
 
         self.last_seen   = time.time()
         self.push_count += 1
-        self.read_errors = 0    # Reset compteur d'erreurs consécutives
+        self.read_errors = 0
         self._rate_n    += 1
         dt = time.time() - self._rate_t
         if dt >= 1.0:
@@ -273,8 +285,9 @@ class ServoState:
             self._rate_n   = 0
             self._rate_t   = time.time()
 
-        self.hist_current  = self.hist_current[1:]  + [self.present_current]
-        self.hist_velocity = self.hist_velocity[1:] + [self.present_velocity]
+        self.hist_current    = self.hist_current[1:]    + [self.present_current]
+        self.hist_velocity   = self.hist_velocity[1:]   + [self.present_velocity]
+        self.hist_velocity_b = self.hist_velocity_b[1:] + [self.present_velocity_b]
 
     def is_alive(self) -> bool:
         return self.last_seen > 0 and (time.time() - self.last_seen) < self.TIMEOUT_S
@@ -285,20 +298,17 @@ class ServoState:
 # ════════════════════════════════════════════
 class DynamixelBus:
     PROTOCOL       = 2.0
-    # [FIX CRIT-1] 20ms entre les deux lectures séquentielles
-    # (suffisant pour que l'ESP32 1 termine sa réponse avant qu'on lise l'ESP32 2)
-    INTER_SERVO_MS = 0.020   # 20ms
+    INTER_SERVO_MS = 0.020   # 20ms entre lectures séquentielles [FIX CRIT-1]
 
-    def __init__(self, port: str = '/dev/ttyUSB0',
+    def __init__(self, port: str = '/dev/ttyTHS1',
                  baudrate: int = 115200,
                  servo_ids: list = None,
                  read_hz: float = 25.0):
         self.port      = port
         self.baudrate  = baudrate
-        self.servo_ids = servo_ids or [1]
+        self.servo_ids = servo_ids or [1, 2]
         self.read_hz   = read_hz
-        # [FIX CRIT-3] Lock unique pour TOUTE la séquence de lecture multi-servo
-        self.lock      = threading.Lock()
+        self.lock      = threading.Lock()   # [FIX CRIT-3]
         self._running  = False
         self.servos    = {sid: ServoState(servo_id=sid) for sid in self.servo_ids}
 
@@ -318,20 +328,21 @@ class DynamixelBus:
         if not self.ph.setBaudRate(baudrate):
             raise RuntimeError(f"Erreur baudrate {baudrate}")
 
-        # Tentative de réduction du latency timer USB (1ms au lieu de 16ms)
         self._set_latency_timer(port, 1)
 
-        print(f'[DXL] {port} @ {baudrate} baud | servos={self.servo_ids} '
-              f'| {read_hz}Hz | inter_servo={int(self.INTER_SERVO_MS*1000)}ms')
+        print(f'[DXL v3.0] {port} @ {baudrate} baud | '
+              f'servos={self.servo_ids} | {read_hz}Hz | 4 moteurs A+B')
+        print(f'[DXL] CT_GOAL_VEL_B=108  CT_NOW_VEL_B=132  '
+              f'READ {READ_START}→{READ_END} ({READ_LEN}B)')
 
         self._startup_ping()
         self._running = True
-        threading.Thread(target=self._read_loop, daemon=True, name='dxl-read').start()
+        threading.Thread(target=self._read_loop, daemon=True,
+                         name='dxl-read').start()
 
     def _set_latency_timer(self, port: str, ms: int = 1):
         try:
             dev = port.split('/')[-1]
-            # Chercher dans différents emplacements selon le kernel
             candidates = [
                 f'/sys/bus/usb-serial/devices/{dev}/latency_timer',
                 f'/sys/bus/usb/drivers/ftdi_sio/{dev}/latency_timer',
@@ -345,18 +356,19 @@ class DynamixelBus:
                                    timeout=2)
                     with open(lt) as f:
                         val = f.read().strip()
-                    print(f'[DXL] Latency timer: {val}ms ({lt})')
+                    print(f'[DXL] Latency timer: {val}ms')
                     return
                 except FileNotFoundError:
                     continue
-            print('[DXL] Latency timer: chemin non trouvé (non critique)')
         except Exception as e:
             print(f'[DXL] Latency timer: erreur ({e})')
 
     def _sim_loop(self):
         while self._running:
             for s in self.servos.values():
-                s.last_seen = time.time()
+                s.last_seen          = time.time()
+                s.present_velocity   = s.goal_velocity
+                s.present_velocity_b = s.goal_velocity_b
             time.sleep(1.0 / self.read_hz)
 
     def _startup_ping(self):
@@ -370,20 +382,17 @@ class DynamixelBus:
             time.sleep(0.05)
 
     # ────────────────────────────────────────
-    # [FIX CRIT-1+3] Boucle de lecture séquentielle avec lock global
+    # Boucle de lecture [FIX CRIT-1+3]
     # ────────────────────────────────────────
     def _read_loop(self):
         interval = 1.0 / self.read_hz
         while self._running:
             t0 = time.time()
-            # [FIX CRIT-3] Lock maintenu pour TOUTE la séquence multi-servo.
-            # Garantit qu'aucun write ne peut s'intercaler entre les deux reads.
             with self.lock:
                 for i, sid in enumerate(self.servo_ids):
                     if not self._running:
                         break
                     if i > 0:
-                        # Petite pause entre servos (dans le lock = bus occupé)
                         time.sleep(self.INTER_SERVO_MS)
                     self._read_one_nolock(sid)
             elapsed = time.time() - t0
@@ -392,25 +401,23 @@ class DynamixelBus:
                 time.sleep(rem)
 
     def _read_one_nolock(self, sid: int):
-        """Lecture sans prendre le lock (doit être appelé avec lock déjà acquis)."""
-        data, result, _ = self.pkt.readTxRx(self.ph, sid, READ_START, READ_LEN)
+        data, result, _ = self.pkt.readTxRx(
+            self.ph, sid, READ_START, READ_LEN)
         if result != COMM_SUCCESS:
             self.servos[sid].read_errors += 1
-            err_count = self.servos[sid].read_errors
-            # Log seulement tous les 20 échecs pour ne pas saturer les logs
-            if err_count == 1 or err_count % 20 == 0:
-                print(f'[DXL ERR] S{sid} ({err_count}x): '
+            ec = self.servos[sid].read_errors
+            if ec == 1 or ec % 20 == 0:
+                print(f'[DXL ERR] S{sid} ({ec}x): '
                       f'{self.pkt.getTxRxResult(result)}')
             return
         if data and len(data) >= READ_LEN:
             self.servos[sid].update_from_raw(bytes(data[:READ_LEN]))
 
     # ────────────────────────────────────────
-    # Écritures (prennent le lock)
+    # Primitives d'écriture
     # ────────────────────────────────────────
     def _w1(self, sid: int, addr: int, val: int) -> bool:
-        if self._sim:
-            return True
+        if self._sim: return True
         with self.lock:
             r, _ = self.pkt.write1ByteTxRx(self.ph, sid, addr, val & 0xFF)
         ok = (r == COMM_SUCCESS)
@@ -419,91 +426,92 @@ class DynamixelBus:
         return ok
 
     def _w2(self, sid: int, addr: int, val: int) -> bool:
-        if self._sim:
-            return True
+        if self._sim: return True
         with self.lock:
-            r, _ = self.pkt.write2ByteTxRx(self.ph, sid, addr, val & 0xFFFF)
+            r, _ = self.pkt.write2ByteTxRx(
+                self.ph, sid, addr, val & 0xFFFF)
         return (r == COMM_SUCCESS)
 
     def _w4(self, sid: int, addr: int, val: int) -> bool:
-        if self._sim:
-            return True
+        if self._sim: return True
         with self.lock:
-            r, _ = self.pkt.write4ByteTxRx(self.ph, sid, addr, val & 0xFFFFFFFF)
+            r, _ = self.pkt.write4ByteTxRx(
+                self.ph, sid, addr, val & 0xFFFFFFFF)
         return (r == COMM_SUCCESS)
 
     # ────────────────────────────────────────
     # API publique
     # ────────────────────────────────────────
     def set_operating_mode(self, sid: int, mode: int) -> bool:
-        """
-        [FIX CRIT-2] Met à jour commanded_mode IMMÉDIATEMENT,
-        indépendamment du succès de la communication.
-        Garantit que le nœud ROS2 ne redétecte pas un "changement
-        de mode" si la lecture est momentanément indisponible.
-        """
+        """[FIX CRIT-2] commanded_mode mis à jour immédiatement."""
         state = self.servos.get(sid)
         if state is None:
             return False
-
         was_torque = state.torque_commanded
         if was_torque:
             self._w1(sid, CT.TORQUE_ENABLE, 0)
             state.torque_commanded = False
             time.sleep(0.12)
-
         ok = self._w1(sid, CT.OPERATING_MODE, mode)
-
-        # [FIX CRIT-2] Mettre à jour commanded_mode même si ok=False
-        # (l'ESP32 a peut-être quand même appliqué la commande sans ACK)
-        state.commanded_mode  = mode
-        state.operating_mode  = mode   # Synchroniser aussi operating_mode
-
+        state.commanded_mode = mode
+        state.operating_mode = mode
         time.sleep(0.12)
         if was_torque:
             self._w1(sid, CT.TORQUE_ENABLE, 1)
             state.torque_commanded = True
-
-        print(f'[DXL] S{sid} mode→{mode} {"OK" if ok else "ERR (commandé quand même)"}')
+        print(f'[DXL] S{sid} mode→{mode} {"OK" if ok else "ERR"}')
         return ok
 
     def set_torque(self, sid: int, enable: bool) -> bool:
         ok = self._w1(sid, CT.TORQUE_ENABLE, 1 if enable else 0)
         state = self.servos.get(sid)
         if state is not None:
-            # [FIX CRIT-2] Mettre à jour l'état commandé immédiatement
             state.torque_commanded = enable
             if ok:
                 state.torque_enabled = enable
         return ok
 
-    def set_profile(self, sid: int,
-                    velocity_rpm: float = 0.0,
-                    accel_rpm2: float   = 0.0) -> bool:
+    def set_profile(self, sid: int, velocity_rpm: float = 0.0) -> bool:
+        """
+        [FIX CT-2] Profile velocity seulement (registre 112).
+        L'ESP32 n'a PAS de registre profile_acceleration —
+        la rampe est gérée en interne (RAMP_RPM_S=800 dans le firmware).
+        """
         v = abs(Conv.rpm_to_vel(velocity_rpm)) if velocity_rpm > 0 else 0
-        a = int(abs(accel_rpm2) / 214.577)     if accel_rpm2  > 0 else 0
-        ok  = self._w4(sid, CT.PROFILE_VELOCITY,     v)
-        ok &= self._w4(sid, CT.PROFILE_ACCELERATION, a)
+        ok = self._w4(sid, CT.PROFILE_VELOCITY, v)
         state = self.servos.get(sid)
         if ok and state is not None:
-            state.profile_velocity     = velocity_rpm
-            state.profile_acceleration = accel_rpm2
-        return bool(ok)
-
-    def goal_position(self, sid: int, degrees: float) -> bool:
-        raw = Conv.deg_to_pos(degrees) & 0xFFFFFFFF
-        ok  = self._w4(sid, CT.GOAL_POSITION, raw)
-        if ok:
-            self.servos[sid].goal_position = degrees
+            state.profile_velocity = velocity_rpm
         return ok
 
     def goal_velocity(self, sid: int, rpm: float) -> bool:
+        """Moteur A (avant) — CT_GOAL_VEL (104)."""
         raw = Conv.rpm_to_vel(rpm)
         if raw < 0:
             raw += 0x100000000
         ok = self._w4(sid, CT.GOAL_VELOCITY, raw & 0xFFFFFFFF)
         if ok:
             self.servos[sid].goal_velocity = rpm
+        return ok
+
+    def goal_velocity_b(self, sid: int, rpm: float) -> bool:
+        """
+        Moteur B (arrière) — CT_GOAL_VEL_B (108).
+        [4M-1] Nouvelle méthode — était incorrectement PROFILE_ACCELERATION.
+        """
+        raw = Conv.rpm_to_vel(rpm)
+        if raw < 0:
+            raw += 0x100000000
+        ok = self._w4(sid, CT.GOAL_VELOCITY_B, raw & 0xFFFFFFFF)
+        if ok:
+            self.servos[sid].goal_velocity_b = rpm
+        return ok
+
+    def goal_position(self, sid: int, degrees: float) -> bool:
+        raw = Conv.deg_to_pos(degrees) & 0xFFFFFFFF
+        ok  = self._w4(sid, CT.GOAL_POSITION, raw)
+        if ok:
+            self.servos[sid].goal_position = degrees
         return ok
 
     def goal_current(self, sid: int, ma: float) -> bool:
@@ -526,21 +534,18 @@ class DynamixelBus:
 
     def sync_goal_velocity(self, targets: dict) -> bool:
         """
-        SyncWrite: envoie les consignes RPM à plusieurs servos dans
-        un seul paquet — les deux moteurs démarrent simultanément,
-        éliminant le décalage temporel inter-moteur.
+        SyncWrite moteur A sur plusieurs slaves simultanément.
+        targets = {sid: rpm_a, ...}
         """
         if self._sim:
             for sid, rpm in targets.items():
                 if sid in self.servos:
                     self.servos[sid].goal_velocity = rpm
             return True
-
         sw = GroupSyncWrite(self.ph, self.pkt, CT.GOAL_VELOCITY, 4)
         for sid, rpm in targets.items():
             raw = Conv.rpm_to_vel(rpm)
-            if raw < 0:
-                raw += 0x100000000
+            if raw < 0: raw += 0x100000000
             raw &= 0xFFFFFFFF
             sw.addParam(sid, [
                 DXL_LOBYTE(DXL_LOWORD(raw)), DXL_HIBYTE(DXL_LOWORD(raw)),
@@ -553,6 +558,35 @@ class DynamixelBus:
             for sid, rpm in targets.items():
                 if sid in self.servos:
                     self.servos[sid].goal_velocity = rpm
+        return ok
+
+    def sync_goal_velocity_b(self, targets: dict) -> bool:
+        """
+        SyncWrite moteur B sur plusieurs slaves simultanément.
+        targets = {sid: rpm_b, ...}
+        [4M-1] Nouvelle méthode pour moteur B (CT_GOAL_VEL_B = 108).
+        """
+        if self._sim:
+            for sid, rpm in targets.items():
+                if sid in self.servos:
+                    self.servos[sid].goal_velocity_b = rpm
+            return True
+        sw = GroupSyncWrite(self.ph, self.pkt, CT.GOAL_VELOCITY_B, 4)
+        for sid, rpm in targets.items():
+            raw = Conv.rpm_to_vel(rpm)
+            if raw < 0: raw += 0x100000000
+            raw &= 0xFFFFFFFF
+            sw.addParam(sid, [
+                DXL_LOBYTE(DXL_LOWORD(raw)), DXL_HIBYTE(DXL_LOWORD(raw)),
+                DXL_LOBYTE(DXL_HIWORD(raw)), DXL_HIBYTE(DXL_HIWORD(raw)),
+            ])
+        with self.lock:
+            result = sw.txPacket()
+        ok = (result == COMM_SUCCESS)
+        if ok:
+            for sid, rpm in targets.items():
+                if sid in self.servos:
+                    self.servos[sid].goal_velocity_b = rpm
         return ok
 
     def sync_goal_position(self, targets: dict) -> bool:
@@ -614,7 +648,7 @@ class DynamixelBus:
 
 
 # ════════════════════════════════════════════
-# SERVO (façade simplifiée)
+# SERVO — façade simplifiée (4 moteurs)
 # ════════════════════════════════════════════
 class Servo:
     def __init__(self, bus: DynamixelBus, sid: int):
@@ -632,24 +666,35 @@ class Servo:
         return self.bus.set_torque(self.id, False)
 
     def set_profile(self, v: float = 0.0, a: float = 0.0) -> bool:
-        return self.bus.set_profile(self.id, velocity_rpm=v, accel_rpm2=a)
+        """[FIX CT-2] a (acceleration) ignoré — géré par l'ESP32 en interne."""
+        return self.bus.set_profile(self.id, velocity_rpm=v)
 
     def velocity(self, rpm: float) -> bool:
+        """Moteur A (avant) — CT_GOAL_VEL (104)."""
         self.state.goal_velocity = rpm
         return self.bus.goal_velocity(self.id, rpm)
 
+    def velocity_b(self, rpm: float) -> bool:
+        """
+        Moteur B (arrière) — CT_GOAL_VEL_B (108).
+        [4M-3] Nouvelle méthode.
+        """
+        self.state.goal_velocity_b = rpm
+        return self.bus.goal_velocity_b(self.id, rpm)
+
     def stop(self) -> bool:
-        self.state.goal_velocity = 0.0
-        return self.bus.goal_velocity(self.id, 0.0)
+        """Arrête les deux moteurs A et B."""
+        self.state.goal_velocity   = 0.0
+        self.state.goal_velocity_b = 0.0
+        ok  = self.bus.goal_velocity(self.id, 0.0)
+        ok &= self.bus.goal_velocity_b(self.id, 0.0)
+        return bool(ok)
 
     def move_to(self, degrees: float,
                 profile_rpm: float = None,
                 profile_accel: float = None) -> bool:
-        if profile_rpm is not None or profile_accel is not None:
-            self.set_profile(
-                v=profile_rpm   if profile_rpm   is not None else self.state.profile_velocity,
-                a=profile_accel if profile_accel is not None else self.state.profile_acceleration,
-            )
+        if profile_rpm is not None:
+            self.set_profile(v=profile_rpm)
         self.state.goal_position = degrees
         return self.bus.goal_position(self.id, degrees)
 
@@ -666,10 +711,8 @@ class Servo:
         return self.bus.goal_pwm(self.id, pct)
 
     def is_moving(self, thr: float = 1.0) -> bool:
-        return abs(self.state.present_velocity) > thr
-
-    def is_at_target(self, tol: float = 1.0) -> bool:
-        return abs(self.state.present_position - self.state.goal_position) < tol
+        return (abs(self.state.present_velocity)   > thr or
+                abs(self.state.present_velocity_b) > thr)
 
     def has_error(self) -> bool:
         return self.state.hardware_error != 0
@@ -680,21 +723,19 @@ class Servo:
         stall = ' [STALL]' if s.stall_flag else ''
         return (
             f'S{self.id}[{ok}] '
-            f'cmd_mode={s.commanded_mode} torq={"ON" if s.torque_commanded else "OFF"} '
-            f'pos={s.present_position:7.2f}deg '
-            f'vel={s.present_velocity:+6.1f}rpm '
-            f'cur={s.present_current:6.1f}mA '
-            f'zone={s.vel_zone}{stall} '
-            f'errs={s.read_errors} rate={s.push_rate:.1f}Hz'
+            f'mode={s.commanded_mode} torq={"ON" if s.torque_commanded else "OFF"} | '
+            f'A: SP={s.goal_velocity:+6.1f}  mes={s.present_velocity:+6.1f}rpm  '
+            f'cur={s.present_current:5.0f}mA | '
+            f'B: SP={s.goal_velocity_b:+6.1f}  mes={s.present_velocity_b:+6.1f}rpm | '
+            f'zone={s.vel_zone}{stall}  errs={s.read_errors}  {s.push_rate:.1f}Hz'
         )
 
 
 # ════════════════════════════════════════════
 # KEEPALIVE — renvoie les consignes périodiquement
+# [4M-4] Renvoie aussi goal_velocity_b
 # ════════════════════════════════════════════
 class KeepAlive:
-    """Renvoie périodiquement la consigne de vitesse pour éviter le timeout ESP32."""
-
     def __init__(self, bus: DynamixelBus, servos: list, interval: float = 1.0):
         self.bus      = bus
         self.servos   = servos
@@ -718,8 +759,12 @@ class KeepAlive:
                 st = s.state
                 if not st.torque_commanded:
                     continue
-                if st.commanded_mode == Mode.VELOCITY and st.goal_velocity != 0.0:
-                    self.bus.goal_velocity(s.id, st.goal_velocity)
+                if st.commanded_mode == Mode.VELOCITY:
+                    # [4M-4] Renvoyer moteur A ET moteur B
+                    if st.goal_velocity != 0.0:
+                        self.bus.goal_velocity(s.id, st.goal_velocity)
+                    if st.goal_velocity_b != 0.0:
+                        self.bus.goal_velocity_b(s.id, st.goal_velocity_b)
 
 
 # ════════════════════════════════════════════
@@ -728,7 +773,7 @@ class KeepAlive:
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument('--port',     default='/dev/ttyUSB0')
+    ap.add_argument('--port',     default='/dev/ttyTHS1')
     ap.add_argument('--baudrate', default=115200, type=int)
     ap.add_argument('--ids',      default='1,2')
     ap.add_argument('--hz',       default=25.0, type=float)
@@ -744,19 +789,21 @@ if __name__ == '__main__':
 
     if args.demo:
         s = servos[0]
-        print(f'[DEMO] S{s.id}: VELOCITY 30rpm (rampe douce)')
+        print(f'[DEMO] S{s.id}: moteur A=+50rpm  moteur B=+50rpm')
         s.set_mode(Mode.VELOCITY)
         s.enable_torque()
-        s.velocity(30.0)
+        s.velocity(50.0)
+        s.velocity_b(50.0)
 
     print('[MONITOR] Ctrl+C pour arrêter')
     try:
         while True:
             for s in servos:
                 print('  ' + s.status_str())
-            time.sleep(0.2)
+            time.sleep(0.25)
     except KeyboardInterrupt:
         ka.stop()
         for s in servos:
+            s.stop()
             s.disable_torque()
         bus.close()
