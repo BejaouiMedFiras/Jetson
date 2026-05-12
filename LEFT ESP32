@@ -1,0 +1,746 @@
+// ============================================
+// ESP32 — DYNAMIXEL PROTOCOL 2.0 SLAVE v5.0L
+// SLAVE ID = 1  →  CÔTÉ GAUCHE (2 MOTEURS)
+// Moteur : JGA25-371  12V  620 RPM à vide
+//
+// ════════════════════════════════════════════
+// CORRECTIONS v5.0L vs v4.2 (CÔTÉ GAUCHE) :
+//
+//   [FIX CRITIQUE] MAX_RPM_FREE : 120 → 620
+//       v4.2 laissait MAX_RPM_FREE = 120, IDENTIQUE au côté DROIT v4.2.
+//       Conséquence sur les virages :
+//         Python envoie  roue_interieure = 52 rpm
+//         ESP32 calcule  ratio = 52 / 120 = 0.433 → PWM = 110
+//         Tension réelle = 110/255 × 12V = 5.18V
+//         Vitesse réelle = 5.18/12 × 620 = 267 rpm  ← 5× trop vite !
+//         Le robot ne tournait JAMAIS correctement côté gauche.
+//       SOLUTION : MAX_RPM_FREE = 620 (valeur moteur réelle).
+//         ratio = 52 / 620 = 0.084 → PWM = 21 → 0.99V → 51 rpm ✓
+//
+//   [FIX E] MAX_RPM_FREE = 620  (voir ci-dessus)
+//   [FIX F] MIN_PWM_DEADBAND = 20 (recalculé pour 620 rpm)
+//       Seuil friction = 20/255 × 620 = 48.6 rpm
+//       Profil virage intérieur (52 rpm) passe juste au-dessus → pas de blocage.
+//   [FIX G] RAMP_RPM_S = 800 (proportionnel à MAX_RPM=620)
+//       Rampe 0→620 rpm en ~0.77s. Protège le BTS7960.
+//       DOIT être identique à PROFILE_ACCEL_RPM_S2 Python.
+//   [FIX A] ENCODEUR B — ISR sur GPIO34 ET GPIO39 (conservé v4.2)
+//   [FIX C] Fenêtre RPM réelle ms_elapsed (conservé v4.2)
+//   [FIX D] Copie GoalVel_A → GoalVel_B si B absent (conservé v4.2)
+//
+// ════════════════════════════════════════════
+// OPTIMISATION VIRAGES JGA25-371 620RPM
+//
+//   MODE VIRAGE DIFFÉRENTIEL :
+//     Roue EXTÉRIEURE : 620 rpm → PWM 255 → 12.00V  (pleine vitesse)
+//     Roue INTÉRIEURE : variable selon rayon de braquage
+//
+//   Tableau roue intérieure (alim 12V) :
+//     rpm=   0  → PWM=  0 → COAST (virage pivot)
+//     rpm=  52  → PWM= 21 → 0.99V  (virage serré : rayon ≈ largeur voie)
+//     rpm= 155  → PWM= 63 → 2.97V  (virage moyen)
+//     rpm= 310  → PWM=127 → 5.98V  (virage large)
+//     rpm= 465  → PWM=191 → 8.99V  (virage très large)
+//     rpm= 620  → PWM=255 → 12.00V (ligne droite)
+//
+//   VIRAGE PIVOT (tour sur place) :
+//     Gauche  +620 rpm / Droite -620 rpm  → PWM ±255
+//
+//   RÈGLE Python ↔ ESP32 :
+//     Python MAX_RPM = 620  ↔  ESP32 MAX_RPM_FREE = 620  ✓  OBLIGATOIRE
+//
+// ════════════════════════════════════════════
+// CÂBLAGE BTS7960 (IBT-2) :
+//   V_sortie = V_alim × (PWM/255)
+//   Pour 11V sur alim 12V : PWM = 234 → 568 rpm
+// ════════════════════════════════════════════
+
+#include "soc/gpio_struct.h"
+#include "WiFi.h"
+#include "esp_bt.h"
+
+// ── SLAVE ID ──────────────────────────────────
+#define SLAVE_ID        1   // Côté GAUCHE
+
+// ── Délais anti-collision RS485 ───────────────
+#define PING_DELAY_US   (500  + (uint32_t)(SLAVE_ID - 1) * 4000)
+#define READ_DELAY_US   (400  + (uint32_t)(SLAVE_ID - 1) * 100)
+#define WRITE_DELAY_US  (400  + (uint32_t)(SLAVE_ID - 1) * 100)
+
+// ── Pins Moteur A (Avant-Gauche) ─────────────
+#define RPWM_A         25
+#define LPWM_A         26
+#define R_EN_A         27
+#define L_EN_A         14
+#define ENC_A_A        32
+#define ENC_B_A        33
+#define ACS_PIN_A      35
+
+// ── Pins Moteur B (Arrière-Gauche) ───────────
+#define RPWM_B         18
+#define LPWM_B         19
+#define R_EN_B         22
+#define L_EN_B         23
+#define ENC_A_B        34   // INPUT ONLY (no pullup)
+#define ENC_B_B        39   // VN — INPUT ONLY (no pullup)
+#define ACS_PIN_B      36   // VP — INPUT ONLY
+
+// ── RS485 ─────────────────────────────────────
+#define RX2            16
+#define TX2            17
+#define RS485_DE        4
+
+// ── Motor config ──────────────────────────────
+#define PWM_FREQ            1000
+#define PWM_RESOLUTION         8
+#define PULSES_PER_REV    1364.8f
+
+// ════════════════════════════════════════════
+// CALIBRATION RPM → PWM  (JGA25-371 12V 620RPM)
+// ════════════════════════════════════════════
+//
+// [FIX E] MAX_RPM_FREE = 620 — VALEUR RÉELLE DU JGA25-371
+//
+//   ANCIEN v4.2 (MAX_RPM_FREE=120) : ERREUR GRAVE EN VIRAGE
+//     goal_rpm=52  → ratio=52/120=0.43 → PWM=110 → 5.18V → 267 rpm réels ✗
+//     goal_rpm=620 → ratio=5.16→clampé→ PWM=255 → 12V   → 620 rpm réels ✓
+//
+//   NOUVEAU v5.0L (MAX_RPM_FREE=620) : CORRECT
+//     goal_rpm=52  → ratio=52/620=0.08 → PWM= 21 → 0.99V →  51 rpm réels ✓
+//     goal_rpm=310 → ratio=0.50        → PWM=127 → 5.98V → 309 rpm réels ✓
+//     goal_rpm=620 → ratio=1.00        → PWM=255 → 12.0V → 620 rpm réels ✓
+//
+#define MAX_RPM_FREE      620.0f
+
+// [FIX F] MIN_PWM_DEADBAND = 20 (recalculé pour 620rpm)
+//   Seuil friction = 20/255 × 620 = 48.6 rpm
+//   Si friction mécanique réelle > 48.6 rpm → augmenter jusqu'à 25 max
+//   Profil virage serré (roue intérieure = 52 rpm) passe au-dessus → OK
+#define MIN_PWM_DEADBAND   20
+
+// PIVOT_COAST_RPM : en dessous de ce seuil → PWM=0 (roue libre / coast)
+//   Permet un vrai pivot : roue intérieure à 0 rpm → arrêt complet
+//   Réduire à 0.5f si la friction empêche l'arrêt en virage pivot
+#define PIVOT_COAST_RPM    1.0f
+
+// ── Feedback Jetson ───────────────────────────
+#define RPM_WINDOW_MS   25
+#define RPM_EMA_ALPHA   0.5f
+
+// ── Ramp protection BTS7960 ───────────────────
+// [FIX G] RAMP proportionnel à MAX_RPM=620 : 0→620 en ~0.77s
+// DOIT être identique à PROFILE_ACCEL_RPM_S2 dans le Python controller
+#define RAMP_RPM_S     800.0f
+
+// ── ACS712 ────────────────────────────────────
+#define ACS_SENSITIVITY   185.0f
+#define ACS_SAMPLES           9
+#define ACS_EMA_ALPHA      0.15f
+
+// ── Protocol 2.0 ──────────────────────────────
+#define DXL_HDR0     0xFF
+#define DXL_HDR1     0xFF
+#define DXL_HDR2     0xFD
+#define DXL_RESERVED 0x00
+#define BROADCAST_ID 0xFE
+#define INST_PING    0x01
+#define INST_READ    0x02
+#define INST_WRITE   0x03
+#define INST_SYNC_WR 0x83
+#define INST_BULK_RD 0x8A
+#define INST_BULK_WR 0x8B
+#define INST_STATUS  0x55
+
+// ── Control Table ─────────────────────────────
+#define CT_MODEL_L    0
+#define CT_MODEL_H    1
+#define CT_FW_VER     6
+#define CT_ID         7
+#define CT_BAUD       8
+#define CT_OP_MODE   11
+#define CT_TORQUE_EN 64
+#define CT_HW_ERROR  70
+#define CT_GOAL_PWM  100
+#define CT_GOAL_CUR  102
+#define CT_GOAL_VEL  104
+#define CT_GOAL_VEL_B 108
+#define CT_PROF_VEL  112
+#define CT_GOAL_POS  116
+#define CT_NOW_PWM   124
+#define CT_NOW_CUR   126
+#define CT_NOW_VEL   128
+#define CT_NOW_VEL_B 132
+#define CT_VOLTAGE   144
+#define CT_TEMP      146
+#define CT_SIZE      160
+
+#define MODE_VELOCITY    1
+#define MODE_PWM        16
+
+// VEL_UNIT : unité Dynamixel → RPM  (0.229 rpm/unit)
+#define VEL_UNIT  0.229f
+#define PWM_UNIT  0.113f
+#define CUR_UNIT  2.69f
+
+// ════════════════════════════════════════════
+// CONTROL TABLE
+// ════════════════════════════════════════════
+uint8_t ct[CT_SIZE] = {0};
+
+void ct_init() {
+  ct[CT_MODEL_L]   = 0x20; ct[CT_MODEL_H] = 0x08;
+  ct[CT_FW_VER]    = 0x50;   // v5.0L
+  ct[CT_ID]        = SLAVE_ID;
+  ct[CT_BAUD]      = 3;
+  ct[CT_OP_MODE]   = MODE_VELOCITY;
+  ct[CT_TORQUE_EN] = 0;
+}
+
+uint16_t ct_r2(uint16_t a)  { return (uint16_t)ct[a]|((uint16_t)ct[a+1]<<8); }
+uint32_t ct_r4(uint16_t a)  { return (uint32_t)ct[a]|((uint32_t)ct[a+1]<<8)|((uint32_t)ct[a+2]<<16)|((uint32_t)ct[a+3]<<24); }
+int16_t  ct_r2s(uint16_t a) { return (int16_t)ct_r2(a); }
+int32_t  ct_r4s(uint16_t a) { return (int32_t)ct_r4(a); }
+void ct_w2(uint16_t a, int16_t v)  { uint16_t u=(uint16_t)v; ct[a]=u&0xFF; ct[a+1]=(u>>8)&0xFF; }
+void ct_w4(uint16_t a, int32_t v)  { uint32_t u=(uint32_t)v; ct[a]=u&0xFF; ct[a+1]=(u>>8)&0xFF; ct[a+2]=(u>>16)&0xFF; ct[a+3]=(u>>24)&0xFF; }
+
+// ════════════════════════════════════════════
+// CRC-16/IBM
+// ════════════════════════════════════════════
+uint16_t dxl_crc(const uint8_t *d, uint16_t len) {
+  uint16_t crc = 0;
+  for (uint16_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)d[i] << 8;
+    for (uint8_t j = 0; j < 8; j++)
+      crc = (crc & 0x8000) ? (crc<<1)^0x8005 : crc<<1;
+  }
+  return crc;
+}
+
+// ════════════════════════════════════════════
+// ENCODEUR A — GPIO 32/33 (INPUT_PULLUP OK)
+// ════════════════════════════════════════════
+volatile int32_t encCountA = 0;
+volatile uint8_t encPrevA  = 0;
+static const int8_t QEM[16] = {0,-1,1,0, 1,0,0,-1, -1,0,0,1, 0,1,-1,0};
+
+void IRAM_ATTR encISR_A() {
+  uint32_t reg = GPIO.in1.val;
+  uint8_t  a   = (reg >> (ENC_A_A - 32)) & 1;
+  uint8_t  b   = (reg >> (ENC_B_A - 32)) & 1;
+  uint8_t  cur = (a << 1) | b;
+  int8_t   d   = QEM[(encPrevA << 2) | cur];
+  if (d) { encCountA += d; encPrevA = cur; }
+}
+
+int32_t encA_get() {
+  portDISABLE_INTERRUPTS(); int32_t v = encCountA; portENABLE_INTERRUPTS(); return v;
+}
+
+// ════════════════════════════════════════════
+// ENCODEUR B — GPIO 34/39 (INPUT ONLY, no pullup)
+// [FIX A] Les DEUX broches ont une ISR (conservé v4.2)
+//         GPIO34 = bit 2 de GPIO.in1
+//         GPIO39 = bit 7 de GPIO.in1
+// ════════════════════════════════════════════
+volatile int32_t encCountB = 0;
+volatile uint8_t encPrevB  = 0;
+
+void IRAM_ATTR encISR_B() {
+  uint32_t reg = GPIO.in1.val;
+  uint8_t  a   = (reg >> (ENC_A_B - 32)) & 1;
+  uint8_t  b   = (reg >> (ENC_B_B - 32)) & 1;
+  uint8_t  cur = (a << 1) | b;
+  int8_t   d   = QEM[(encPrevB << 2) | cur];
+  if (d) { encCountB += d; encPrevB = cur; }
+}
+
+int32_t encB_get() {
+  portDISABLE_INTERRUPTS(); int32_t v = encCountB; portENABLE_INTERRUPTS(); return v;
+}
+
+// ════════════════════════════════════════════
+// ACS712
+// ════════════════════════════════════════════
+float acsOffsetA  = 0.0f;
+float acsOffsetB  = 0.0f;
+float acsCurrentA = 0.0f;
+float acsCurrentB = 0.0f;
+
+void bubble_sort(float *arr, int n) {
+  for (int i = 0; i < n-1; i++)
+    for (int j = 0; j < n-i-1; j++)
+      if (arr[j] > arr[j+1]) { float t=arr[j]; arr[j]=arr[j+1]; arr[j+1]=t; }
+}
+
+void acs_calibrate_one(int pin, float &offset, const char* name) {
+  Serial.printf("[ACS %s] Calibration... ", name);
+  float medians[22]; int nm = 0;
+  for (int g = 0; g < 22; g++) {
+    float buf[9];
+    for (int i = 0; i < 9; i++) { buf[i] = (float)analogReadMilliVolts(pin); delayMicroseconds(200); }
+    bubble_sort(buf, 9); medians[nm++] = buf[4];
+  }
+  float sum = 0;
+  for (int i = 0; i < nm; i++) sum += medians[i];
+  offset = sum / nm;
+  Serial.printf("zero=%.1f mV\n", offset);
+}
+
+float acs_update_one(int pin, float offset, float &current) {
+  float buf[ACS_SAMPLES];
+  for (int i = 0; i < ACS_SAMPLES; i++) { buf[i] = (float)analogReadMilliVolts(pin); delayMicroseconds(150); }
+  bubble_sort(buf, ACS_SAMPLES);
+  float raw_ma = (buf[ACS_SAMPLES/2] - offset) / ACS_SENSITIVITY * 1000.0f;
+  current = ACS_EMA_ALPHA * raw_ma + (1.0f - ACS_EMA_ALPHA) * current;
+  return current;
+}
+
+// ════════════════════════════════════════════
+// BTS7960 MOTOR DRIVER
+// ════════════════════════════════════════════
+void motor_pwm_A(int pwm) {
+  pwm = constrain(pwm, -255, 255);
+  if (pwm > 0)       { ledcWrite(RPWM_A, 0);    ledcWrite(LPWM_A, pwm);  }
+  else if (pwm < 0)  { ledcWrite(RPWM_A, -pwm); ledcWrite(LPWM_A, 0);   }
+  else               { ledcWrite(RPWM_A, 0);    ledcWrite(LPWM_A, 0);   }
+}
+
+void motor_pwm_B(int pwm) {
+  pwm = constrain(pwm, -255, 255);
+  if (pwm > 0)       { ledcWrite(RPWM_B, 0);    ledcWrite(LPWM_B, pwm);  }
+  else if (pwm < 0)  { ledcWrite(RPWM_B, -pwm); ledcWrite(LPWM_B, 0);   }
+  else               { ledcWrite(RPWM_B, 0);    ledcWrite(LPWM_B, 0);   }
+}
+
+void motor_stop_A()   { ledcWrite(RPWM_A, 0); ledcWrite(LPWM_A, 0); }
+void motor_stop_B()   { ledcWrite(RPWM_B, 0); ledcWrite(LPWM_B, 0); }
+void motor_stop_all() { motor_stop_A(); motor_stop_B(); }
+
+// ════════════════════════════════════════════
+// CONVERSION RPM → PWM  (JGA25-371 620RPM)
+//
+// [FIX E+F+TURN] Optimisé pour virages différentiels
+//
+// Logique :
+//   |rpm| < PIVOT_COAST_RPM  → PWM = 0 (roue libre, virage pivot propre)
+//   |rpm| dans la zone morte → PWM = ±MIN_PWM_DEADBAND (friction statique)
+//   sinon                    → PWM proportionnel linéaire
+//
+// Tableau complet (alim 12V, JGA25-371) :
+//   rpm=   0  → PWM=  0  →  0.00V  (coast, virage pivot)
+//   rpm=  52  → PWM= 21  →  0.99V  (virage serré)
+//   rpm= 100  → PWM= 41  →  1.93V
+//   rpm= 200  → PWM= 82  →  3.86V
+//   rpm= 310  → PWM=127  →  5.98V  (mi-vitesse)
+//   rpm= 450  → PWM=185  →  8.71V
+//   rpm= 560  → PWM=230  → 10.82V
+//   rpm= 568  → PWM=234  → 11.01V  ← objectif 11V
+//   rpm= 620  → PWM=255  → 12.00V  (pleine vitesse)
+// ════════════════════════════════════════════
+int rpm_to_pwm(float rpm) {
+  // Seuil pivot : roue à l'arrêt complet → virage pivot propre
+  if (fabsf(rpm) < PIVOT_COAST_RPM) return 0;
+
+  float ratio = rpm / MAX_RPM_FREE;
+  ratio = constrain(ratio, -1.0f, 1.0f);
+  int pwm = (int)(ratio * 255.0f);
+
+  // Zone morte : compense la friction statique du réducteur JGA25-371
+  if (pwm > 0 && pwm < MIN_PWM_DEADBAND)  pwm = MIN_PWM_DEADBAND;
+  if (pwm < 0 && pwm > -MIN_PWM_DEADBAND) pwm = -MIN_PWM_DEADBAND;
+
+  return pwm;
+}
+
+// ════════════════════════════════════════════
+// CONTROL LOOP VARIABLES
+// ════════════════════════════════════════════
+unsigned long lastCtrlMs = 0;
+unsigned long lastCurMs  = 0;
+unsigned long lastRpmMs  = 0;
+
+int32_t  rpmPrevA      = 0;
+int32_t  rpmPrevB      = 0;
+float    filteredRPM_A = 0.0f;
+float    filteredRPM_B = 0.0f;
+
+float    rampSP_A = 0.0f;
+float    rampSP_B = 0.0f;
+
+// ════════════════════════════════════════════
+// CONTROL LOOP
+// ════════════════════════════════════════════
+void control_loop() {
+  unsigned long now = millis();
+  float dt = (now - lastCtrlMs) / 1000.0f;
+  if (dt < 0.005f) return;
+  lastCtrlMs = now;
+
+  uint8_t torque = ct[CT_TORQUE_EN];
+  if (!torque) {
+    motor_stop_all();
+    rampSP_A = rampSP_B = 0.0f;
+    return;
+  }
+
+  // ── Mesure RPM — [FIX C] fenêtre temporelle réelle ──────────────────────
+  if (now - lastRpmMs >= RPM_WINDOW_MS) {
+    float ms_elapsed = (float)(now - lastRpmMs);
+
+    int32_t curA   = encA_get();
+    int32_t deltaA = curA - rpmPrevA;
+    float rawRPM_A = ((float)deltaA / PULSES_PER_REV) / (ms_elapsed / 1000.0f) * 60.0f;
+    filteredRPM_A  = RPM_EMA_ALPHA * rawRPM_A + (1.0f - RPM_EMA_ALPHA) * filteredRPM_A;
+    rpmPrevA       = curA;
+
+    int32_t curB   = encB_get();
+    int32_t deltaB = curB - rpmPrevB;
+    float rawRPM_B = ((float)deltaB / PULSES_PER_REV) / (ms_elapsed / 1000.0f) * 60.0f;
+    filteredRPM_B  = RPM_EMA_ALPHA * rawRPM_B + (1.0f - RPM_EMA_ALPHA) * filteredRPM_B;
+    rpmPrevB       = curB;
+
+    lastRpmMs = now;
+
+    ct_w4(CT_NOW_VEL,   (int32_t)(filteredRPM_A / VEL_UNIT));
+    ct_w4(CT_NOW_VEL_B, (int32_t)(filteredRPM_B / VEL_UNIT));
+  }
+
+  // ── Mode VELOCITY — passthrough différentiel ───────────────────────────
+  if (ct[CT_OP_MODE] == MODE_VELOCITY) {
+    float goal_rpm_A = (float)ct_r4s(CT_GOAL_VEL)   * VEL_UNIT;
+    float goal_rpm_B = (float)ct_r4s(CT_GOAL_VEL_B) * VEL_UNIT;
+
+    // Rampe d'accélération — protège le BTS7960 (RAMP_RPM_S=800 → 0→620 en 0.77s)
+    float step = RAMP_RPM_S * dt;
+
+    if      (rampSP_A < goal_rpm_A - step) rampSP_A += step;
+    else if (rampSP_A > goal_rpm_A + step) rampSP_A -= step;
+    else                                    rampSP_A  = goal_rpm_A;
+
+    if      (rampSP_B < goal_rpm_B - step) rampSP_B += step;
+    else if (rampSP_B > goal_rpm_B + step) rampSP_B -= step;
+    else                                    rampSP_B  = goal_rpm_B;
+
+    // Appliquer PWM max pour roue extérieure, coast pour roue intérieure ~0
+    motor_pwm_A(rpm_to_pwm(rampSP_A));
+    motor_pwm_B(rpm_to_pwm(rampSP_B));
+    return;
+  }
+
+  // ── Mode PWM direct ────────────────────────
+  if (ct[CT_OP_MODE] == MODE_PWM) {
+    float goal_pct = (float)ct_r2s(CT_GOAL_PWM) * PWM_UNIT;
+    int   pwm      = constrain((int)(goal_pct / 100.0f * 255.0f), -255, 255);
+    motor_pwm_A(pwm);
+    motor_pwm_B(pwm);
+    return;
+  }
+}
+
+// ════════════════════════════════════════════
+// RS485 TX
+// ════════════════════════════════════════════
+void rs485_send(const uint8_t *data, uint16_t len) {
+  digitalWrite(RS485_DE, HIGH);
+  delayMicroseconds(200);
+  Serial2.write(data, len);
+  Serial2.flush();
+  delayMicroseconds(200);
+  digitalWrite(RS485_DE, LOW);
+}
+
+void send_status(uint8_t id, uint8_t err, const uint8_t *params, uint16_t plen) {
+  uint16_t length = 1 + 1 + plen + 2;
+  uint8_t  buf[300];
+  uint16_t n = 0;
+  buf[n++]=DXL_HDR0; buf[n++]=DXL_HDR1; buf[n++]=DXL_HDR2; buf[n++]=DXL_RESERVED;
+  buf[n++]=id;
+  buf[n++]=length&0xFF; buf[n++]=(length>>8)&0xFF;
+  buf[n++]=INST_STATUS; buf[n++]=err;
+  for (uint16_t i=0; i<plen; i++) buf[n++]=params[i];
+  uint16_t crc = dxl_crc(buf, n);
+  buf[n++]=crc&0xFF; buf[n++]=(crc>>8)&0xFF;
+  rs485_send(buf, n);
+}
+
+void send_ping_resp() {
+  uint8_t p[3] = {ct[CT_MODEL_L], ct[CT_MODEL_H], ct[CT_FW_VER]};
+  send_status(SLAVE_ID, 0, p, 3);
+}
+
+void send_read_resp(uint16_t addr, uint16_t len) {
+  if (addr+len > CT_SIZE) { send_status(SLAVE_ID, 0x07, nullptr, 0); return; }
+  send_status(SLAVE_ID, 0, &ct[addr], len);
+}
+
+// ════════════════════════════════════════════
+// APPLY WRITE
+// ════════════════════════════════════════════
+void apply_write(uint16_t addr, const uint8_t *data, uint16_t len) {
+  for (uint16_t i=0; i<len && (addr+i)<CT_SIZE; i++)
+    ct[addr+i] = data[i];
+
+  if (addr <= CT_TORQUE_EN && (addr+len) > CT_TORQUE_EN) {
+    if (!ct[CT_TORQUE_EN]) {
+      motor_stop_all();
+      rampSP_A = rampSP_B = 0.0f;
+      filteredRPM_A = filteredRPM_B = 0.0f;
+      Serial.printf("[S%d] Torque OFF\n", SLAVE_ID);
+    } else {
+      rampSP_A = rampSP_B = 0.0f;
+      Serial.printf("[S%d] Torque ON\n", SLAVE_ID);
+    }
+  }
+
+  if (addr <= CT_OP_MODE && (addr+len) > CT_OP_MODE) {
+    rampSP_A = rampSP_B = 0.0f;
+    filteredRPM_A = filteredRPM_B = 0.0f;
+    Serial.printf("[S%d] Mode -> %d\n", SLAVE_ID, ct[CT_OP_MODE]);
+  }
+
+  if (addr <= CT_GOAL_VEL && (addr+len) > CT_GOAL_VEL) {
+    float gA = (float)ct_r4s(CT_GOAL_VEL) * VEL_UNIT;
+    // [FIX D] Si B absent du paquet → copier A → B
+    if (!((addr <= CT_GOAL_VEL_B) && ((addr+len) > CT_GOAL_VEL_B))) {
+      ct_w4(CT_GOAL_VEL_B, ct_r4(CT_GOAL_VEL));
+    }
+    Serial.printf("[S%d] GoalVel_A -> %.1f rpm  pwm=%d\n",
+                  SLAVE_ID, gA, rpm_to_pwm(gA));
+  }
+
+  if (addr <= CT_GOAL_VEL_B && (addr+len) > CT_GOAL_VEL_B) {
+    float gB = (float)ct_r4s(CT_GOAL_VEL_B) * VEL_UNIT;
+    Serial.printf("[S%d] GoalVel_B -> %.1f rpm  pwm=%d\n",
+                  SLAVE_ID, gB, rpm_to_pwm(gB));
+  }
+}
+
+// ════════════════════════════════════════════
+// RX STATE MACHINE
+// ════════════════════════════════════════════
+#define RX_BUF 256
+uint8_t  rxBuf[RX_BUF];
+uint16_t rxIdx=0;
+uint8_t  rxSt=0;
+uint16_t rxLen=0;
+
+void process_packet() {
+  if (rxIdx < 10) return;
+  uint8_t  pid  = rxBuf[4];
+  uint16_t plen = rxBuf[5] | ((uint16_t)rxBuf[6]<<8);
+  uint8_t  inst = rxBuf[7];
+  uint16_t crc_rx   = rxBuf[rxIdx-2] | ((uint16_t)rxBuf[rxIdx-1]<<8);
+  uint16_t crc_calc = dxl_crc(rxBuf, rxIdx-2);
+  if (crc_rx != crc_calc) return;
+  if (inst == INST_STATUS) return;
+  uint8_t  *par  = &rxBuf[8];
+  uint16_t  npar = plen - 3;
+
+  if (inst == INST_PING) {
+    if (pid == SLAVE_ID || pid == BROADCAST_ID) {
+      delayMicroseconds(PING_DELAY_US);
+      send_ping_resp();
+    }
+    return;
+  }
+
+  bool mine = (pid == SLAVE_ID);
+
+  if (inst == INST_READ && mine) {
+    uint16_t a = par[0]|((uint16_t)par[1]<<8);
+    uint16_t l = par[2]|((uint16_t)par[3]<<8);
+    delayMicroseconds(READ_DELAY_US);
+    send_read_resp(a, l);
+    return;
+  }
+
+  if (inst == INST_WRITE && mine) {
+    uint16_t a = par[0]|((uint16_t)par[1]<<8);
+    apply_write(a, &par[2], npar-2);
+    delayMicroseconds(WRITE_DELAY_US);
+    send_status(SLAVE_ID, 0, nullptr, 0);
+    return;
+  }
+
+  if (inst == INST_SYNC_WR) {
+    uint16_t a    = par[0]|((uint16_t)par[1]<<8);
+    uint16_t dlen = par[2]|((uint16_t)par[3]<<8);
+    uint16_t i = 4;
+    while (i+1+dlen <= npar) {
+      if (par[i] == SLAVE_ID) { apply_write(a, &par[i+1], dlen); break; }
+      i += 1+dlen;
+    }
+    return;
+  }
+
+  if (inst == INST_BULK_RD) {
+    int8_t mpos=-1; uint16_t ma=0, ml=0;
+    uint8_t nd = npar/5;
+    for (uint8_t n=0; n<nd; n++) {
+      if (par[n*5] == SLAVE_ID) {
+        mpos=n;
+        ma=par[n*5+1]|((uint16_t)par[n*5+2]<<8);
+        ml=par[n*5+3]|((uint16_t)par[n*5+4]<<8);
+        break;
+      }
+    }
+    if (mpos < 0) return;
+    delayMicroseconds(500 + (uint32_t)mpos * 4000);
+    send_read_resp(ma, ml);
+    return;
+  }
+
+  if (inst == INST_BULK_WR) {
+    uint16_t i = 0;
+    while (i < npar) {
+      if (i + 5 > npar) break;
+      uint8_t  bid   = par[i];
+      uint16_t baddr = par[i+1]|((uint16_t)par[i+2]<<8);
+      uint16_t blen  = par[i+3]|((uint16_t)par[i+4]<<8);
+      i += 5;
+      if (bid == SLAVE_ID && i + blen <= npar) {
+        apply_write(baddr, &par[i], blen);
+      }
+      i += blen;
+    }
+    return;
+  }
+}
+
+void rx_byte(uint8_t c) {
+  switch (rxSt) {
+    case 0: if (c==0xFF) { rxBuf[0]=c; rxIdx=1; rxSt=1; } break;
+    case 1: if (c==0xFF) { rxBuf[1]=c; rxIdx=2; rxSt=2; } else rxSt=0; break;
+    case 2:
+      if      (c==0xFD) { rxBuf[2]=c; rxIdx=3; rxSt=3; }
+      else if (c==0xFF) { rxBuf[1]=c; }
+      else rxSt=0; break;
+    case 3: rxBuf[3]=c; rxIdx=4; rxSt=4; break;
+    case 4: rxBuf[4]=c; rxIdx=5; rxSt=5; break;
+    case 5: rxBuf[5]=c; rxIdx=6; rxLen=c; rxSt=6; break;
+    case 6: rxBuf[6]=c; rxIdx=7; rxLen|=((uint16_t)c<<8); rxSt=7; break;
+    case 7:
+      if (rxIdx<RX_BUF) rxBuf[rxIdx++]=c;
+      if (rxIdx-7 >= rxLen) { process_packet(); rxSt=0; rxIdx=0; } break;
+  }
+}
+
+// ════════════════════════════════════════════
+// UPDATE PRESENT VALUES
+// ════════════════════════════════════════════
+void update_present() {
+  unsigned long now = millis();
+  if (now - lastCurMs > 80) {
+    acs_update_one(ACS_PIN_A, acsOffsetA, acsCurrentA);
+    acs_update_one(ACS_PIN_B, acsOffsetB, acsCurrentB);
+    lastCurMs = now;
+    float avg_ma = (acsCurrentA + acsCurrentB) / 2.0f;
+    ct_w2(CT_NOW_CUR, (int16_t)(avg_ma / CUR_UNIT));
+    ct_w2(CT_VOLTAGE, 120);
+    ct[CT_TEMP] = 35;
+  }
+}
+
+// ════════════════════════════════════════════
+// SETUP
+// ════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.printf("\n╔══════════════════════════════════════════════════════╗\n");
+  Serial.printf("║  ESP32 DXL SLAVE v5.0L  ID=%d  CÔTÉ GAUCHE            ║\n", SLAVE_ID);
+  Serial.printf("║  Moteur : JGA25-371  12V  620 RPM                    ║\n");
+  Serial.printf("╠══════════════════════════════════════════════════════╣\n");
+  Serial.printf("║  [FIX E] MAX_RPM_FREE = %.0f  (était 120 → ERREUR)  ║\n", MAX_RPM_FREE);
+  Serial.printf("║  [FIX F] MIN_PWM_DEADBAND = %d  seuil=%.1f rpm     ║\n",
+                MIN_PWM_DEADBAND, (float)MIN_PWM_DEADBAND/255.0f*MAX_RPM_FREE);
+  Serial.printf("║  [FIX G] RAMP_RPM_S = %.0f                          ║\n", RAMP_RPM_S);
+  Serial.printf("║  PIVOT_COAST_RPM = %.1f (coast si |rpm|<seuil)     ║\n", PIVOT_COAST_RPM);
+  Serial.printf("╠══════════════════════════════════════════════════════╣\n");
+  Serial.printf("║  Moteur A (avant-gauche)  : RPWM=%d LPWM=%d ENC=%d/%d ║\n",
+                RPWM_A, LPWM_A, ENC_A_A, ENC_B_A);
+  Serial.printf("║  Moteur B (arrière-gauche): RPWM=%d LPWM=%d ENC=%d/%d ║\n",
+                RPWM_B, LPWM_B, ENC_A_B, ENC_B_B);
+  Serial.printf("╠══════════════════════════════════════════════════════╣\n");
+  Serial.printf("║  VIRAGE : extérieur=PWM255(12V) intérieur=PWM21(1V) ║\n");
+  Serial.printf("║  PIVOT  : gauche=+255  droite=-255                  ║\n");
+  Serial.printf("║  Pour 11V → %.0f rpm → PWM %d/255               ║\n",
+                11.0f/12.0f*MAX_RPM_FREE, (int)(11.0f/12.0f*255.0f));
+  Serial.printf("╚══════════════════════════════════════════════════════╝\n\n");
+
+  WiFi.mode(WIFI_OFF); btStop(); delay(200);
+  ct_init();
+
+  // ── Moteur A ──────────────────────────────────
+  pinMode(R_EN_A, OUTPUT); pinMode(L_EN_A, OUTPUT);
+  digitalWrite(R_EN_A, HIGH); digitalWrite(L_EN_A, HIGH);
+  ledcAttach(RPWM_A, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(LPWM_A, PWM_FREQ, PWM_RESOLUTION);
+  motor_stop_A();
+
+  // ── Moteur B ──────────────────────────────────
+  pinMode(R_EN_B, OUTPUT); pinMode(L_EN_B, OUTPUT);
+  digitalWrite(R_EN_B, HIGH); digitalWrite(L_EN_B, HIGH);
+  ledcAttach(RPWM_B, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(LPWM_B, PWM_FREQ, PWM_RESOLUTION);
+  motor_stop_B();
+
+  // ── Encodeur A (GPIO 32/33 — INPUT_PULLUP) ─────
+  pinMode(ENC_A_A, INPUT_PULLUP);
+  pinMode(ENC_B_A, INPUT_PULLUP);
+  delayMicroseconds(50);
+  {
+    uint32_t r = GPIO.in1.val;
+    encPrevA = (((r >> (ENC_A_A - 32)) & 1) << 1) | ((r >> (ENC_B_A - 32)) & 1);
+  }
+  attachInterrupt(digitalPinToInterrupt(ENC_A_A), encISR_A, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_A), encISR_A, CHANGE);
+
+  // ── Encodeur B (GPIO 34/39 — INPUT ONLY !) ─────
+  // GPIO39 (VN) : pas de INPUT_PULLUP → INPUT obligatoire
+  // Si signal flotte → résistance pull-up externe 10kΩ vers 3.3V
+  pinMode(ENC_A_B, INPUT);   // GPIO34
+  pinMode(ENC_B_B, INPUT);   // GPIO39 VN
+  delayMicroseconds(50);
+  {
+    uint32_t r = GPIO.in1.val;
+    encPrevB = (((r >> (ENC_A_B - 32)) & 1) << 1) | ((r >> (ENC_B_B - 32)) & 1);
+  }
+  // [FIX A] DEUX interruptions sur encodeur B
+  attachInterrupt(digitalPinToInterrupt(ENC_A_B), encISR_B, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_B), encISR_B, CHANGE);
+
+  acs_calibrate_one(ACS_PIN_A, acsOffsetA, "A");
+  acs_calibrate_one(ACS_PIN_B, acsOffsetB, "B");
+
+  pinMode(RS485_DE, OUTPUT);
+  digitalWrite(RS485_DE, LOW);
+  Serial2.begin(115200, SERIAL_8N1, RX2, TX2);
+  while (Serial2.available()) Serial2.read();
+  delay(100);
+
+  lastCtrlMs = lastCurMs = lastRpmMs = millis();
+
+  uint8_t  tv[] = {0xFF,0xFF,0xFD,0x00,0x01,0x03,0x00,0x01};
+  uint16_t tc   = dxl_crc(tv, 8);
+  Serial.printf("[DXL] CRC test: 0x%04X %s\n", tc, tc==0x4E19?"OK":"FAIL!!!");
+  Serial.printf("[DXL] Prêt — en attente de commandes Jetson\n\n");
+
+  // Diagnostic virages
+  Serial.printf("[VIRAGE] Exemples de couples gauche/droite :\n");
+  Serial.printf("  Ligne droite  : G=+620rpm(PWM255)  D=+620rpm(PWM255)\n");
+  Serial.printf("  Virage droit  : G=+620rpm(PWM255)  D=+ 52rpm(PWM %d)\n", rpm_to_pwm(52.0f));
+  Serial.printf("  Pivot droit   : G=+620rpm(PWM255)  D=-620rpm(PWM255)\n");
+  Serial.printf("  Virage gauche : G=+ 52rpm(PWM %d)  D=+620rpm(PWM255)\n", rpm_to_pwm(52.0f));
+  Serial.printf("  Pivot gauche  : G=-620rpm(PWM255)  D=+620rpm(PWM255)\n\n");
+}
+
+// ════════════════════════════════════════════
+// LOOP
+// ════════════════════════════════════════════
+void loop() {
+  while (Serial2.available()) rx_byte((uint8_t)Serial2.read());
+  update_present();
+  control_loop();
+}
