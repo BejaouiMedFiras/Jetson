@@ -1,45 +1,38 @@
 #!/usr/bin/env python3
 # ============================================
-# DYNAMIXEL ROS2 NODE v1.1
+# DYNAMIXEL ROS2 NODE v2.0
+# 4 MOTEURS INDIVIDUELS — 2 par slave ESP32
 #
-# CORRECTIONS v1.1 (fixes vs v1.0):
-#   [FIX G] _cmd_callback: ordre des opérations corrigé
-#       AVANT: mode → torque → profil → goal
-#              → torque activé AVANT que le mode soit propre
-#              → ESP32 ignore le changement de mode si torque=ON
-#              → rampSP jamais réinitialisé → moteur explose
-#       APRÈS: désactiver torque si mode change → set_mode
-#              (set_mode gère torque OFF/ON en interne)
-#              → profil → torque explicite → goal
+# v2.0 vs v1.1 :
 #
-#   [FIX H] _cmd_callback: skip set_profile si aucune valeur utile
-#       profile_acceleration=0.0 avec profile_velocity=nan ne doit
-#       pas déclencher un write inutile sur le bus
-#       → Guard: has_profile = True seulement si au moins une
-#         valeur est > 0 et non-nan
+#   [4M-A] goal_velocity_b : moteur B (arrière) par slave
+#       Lit msg.goal_velocity_b (DynamixelCommand) et écrit
+#       CT_GOAL_VEL_B (registre 108) via servo.velocity_b().
+#       Si goal_velocity_b est NaN → moteur B = moteur A (miroir).
 #
-#   [FIX I] _cmd_callback: goal_velocity transmis en RPM
-#       msg.goal_velocity est déjà en RPM → servo.velocity(rpm)
-#       → pas de double conversion (inchangé vs v1.0, confirmé OK)
+#   [4M-B] present_velocity_b : feedback encodeur moteur B
+#       Lit CT_NOW_VEL_B (registre 132) depuis servo.state.
+#       Publié dans DynamixelState.present_velocity_b.
 #
-# Topics publiés:
-#   /servo{id}/state  [DynamixelState]  — état temps réel
+#   [4M-C] present_current_b : futur (si ACS712 moteur B)
+#       Publié dans DynamixelState.present_current_b.
 #
-# Topics souscrits:
-#   /servo{id}/command    [DynamixelCommand]  — commande unicast
-#   /broadcast/command    [DynamixelCommand]  — commande tous servos
+#   [4M-D] goal_velocity_b dans DynamixelState
+#       Reflète la consigne en cours pour moteur B.
 #
-# Services:
-#   /servo{id}/set_torque    — active/désactive le couple
-#   /servo{id}/emergency_stop
-#   /emergency_stop          — arrêt d'urgence global
+# Architecture matérielle :
+#   Slave 1 (ID=1, GAUCHE) :
+#     Moteur A = avant-gauche  (enc GPIO32/33, BTS7960 GPIO25/26)
+#     Moteur B = arrière-gauche(enc GPIO34/39, BTS7960 GPIO18/19)
+#   Slave 2 (ID=2, DROIT) :
+#     Moteur A = avant-droit   (enc GPIO32/33, BTS7960 GPIO25/26)
+#     Moteur B = arrière-droit (enc GPIO34/39, BTS7960 GPIO18/19)
 #
-# Paramètres ROS2:
-#   port        (string)    — /dev/ttyUSB0
-#   baudrate    (int)       — 115200
-#   servo_ids   (int[])     — [1, 2]
-#   read_hz     (double)    — 10.0
-#   keepalive   (double)    — 1.0
+# Registres ESP32 utilisés :
+#   CT_GOAL_VEL   = 104  (moteur A, int32, unité = 0.229 rpm)
+#   CT_GOAL_VEL_B = 108  (moteur B, int32, unité = 0.229 rpm)
+#   CT_NOW_VEL    = 128  (moteur A, int32, unité = 0.229 rpm)
+#   CT_NOW_VEL_B  = 132  (moteur B, int32, unité = 0.229 rpm)
 # ============================================
 
 import math
@@ -71,11 +64,11 @@ class DynamixelNode(Node):
     def __init__(self):
         super().__init__('dynamixel_node')
 
-        self.declare_parameter('port', '/dev/ttyUSB0')
-        self.declare_parameter('baudrate',   115200)
+        self.declare_parameter('port',      '/dev/ttyTHS1')
+        self.declare_parameter('baudrate',  115200)
         self.declare_parameter('servo_ids', [1, 2])
-        self.declare_parameter('read_hz',    10.0)
-        self.declare_parameter('keepalive',  1.0)
+        self.declare_parameter('read_hz',   20.0)
+        self.declare_parameter('keepalive', 1.0)
 
         port      = self.get_parameter('port').value
         baudrate  = self.get_parameter('baudrate').value
@@ -84,8 +77,8 @@ class DynamixelNode(Node):
         ka_hz     = self.get_parameter('keepalive').value
 
         self.get_logger().info(
-            f"[DXL] Init bus {port} @ {baudrate} baud | "
-            f"servos={servo_ids} | read={read_hz}Hz"
+            f"[DXL v2.0] bus {port} @ {baudrate} baud | "
+            f"servos={servo_ids} | read={read_hz}Hz | 4 moteurs"
         )
 
         self.bus = DynamixelBus(
@@ -134,25 +127,18 @@ class DynamixelNode(Node):
         self._pub_timer = self.create_timer(
             1.0 / read_hz, self._publish_states)
 
-        self.get_logger().info("[DXL] Nœud prêt")
+        self.get_logger().info(
+            "[DXL v2.0] Prêt — FL/RL (slave1) + FR/RR (slave2)")
 
     # ─────────────────────────────────────────────────────────────────
     # CALLBACK COMMANDE
     # ─────────────────────────────────────────────────────────────────
     def _cmd_callback(self, msg: DynamixelCommand, sid: int):
         """
-        [FIX G] Ordre correct des opérations:
-          1. Si le mode change → désactiver le couple en premier
-             (l'ESP32 IGNORE les changements de mode si torque=ON)
-          2. set_mode() — gère torque OFF/ON en interne si nécessaire
-          3. Profil — après que le mode soit établi, seulement si
-             au moins une valeur est significative (>0, non-nan) [FIX H]
-          4. Activer/désactiver le couple
-          5. Envoyer la consigne de mouvement
-
-        Cette séquence garantit que rampSP sur l'ESP32 est toujours
-        réinitialisé dans la bonne unité (RPM pour VELOCITY, counts
-        pour POSITION) avant que le couple soit activé.
+        Traite une commande pour un slave :
+          - goal_velocity   → moteur A (avant)   CT_GOAL_VEL  (104)
+          - goal_velocity_b → moteur B (arrière) CT_GOAL_VEL_B(108)
+            Si goal_velocity_b est NaN → moteur B = moteur A (miroir)
         """
         servo = self.servo_objs.get(sid)
         if servo is None:
@@ -160,66 +146,53 @@ class DynamixelNode(Node):
             return
 
         # ── 1. Changement de mode ─────────────────────────────────
-        # L'ESP32 exige que le couple soit OFF pour changer de mode.
-        # set_mode() désactive le couple, change le mode, puis
-        # réactive si nécessaire. On l'appelle seulement si le mode
-        # change réellement pour éviter des transitions inutiles.
         mode_requested = msg.operating_mode
         if mode_requested >= 0:
             if mode_requested != servo.state.operating_mode:
                 self.get_logger().info(
-                    f"[DXL] S{sid} changement de mode "
+                    f"[DXL] S{sid} mode "
                     f"{servo.state.operating_mode} → {mode_requested}"
                 )
-                # [FIX G] Forcer torque OFF avant le changement de mode,
-                # même si msg.torque_enable ne le demande pas explicitement.
-                # Cela garantit que l'ESP32 réinitialise rampSP correctement.
                 if servo.state.torque_enabled:
                     servo.disable_torque()
-                    time.sleep(0.05)   # laisse l'ESP32 traiter le torque-off
+                    time.sleep(0.05)
                 servo.set_mode(mode_requested)
-                # set_mode() attend 150ms × 2 en interne → mode stable ici
-            else:
-                self.get_logger().debug(
-                    f"[DXL] S{sid} mode déjà {mode_requested}, pas de changement")
 
         # ── 2. Profil de mouvement ────────────────────────────────
-        # [FIX H] N'écrire le profil que si au moins une valeur est
-        # utile (>0 et non-nan). profile_acceleration=0.0 seul ne
-        # doit pas déclencher un write: 0 sur CT_PROF_ACC est
-        # valide (= utiliser défaut ESP32) mais inutile d'écrire
-        # si l'utilisateur n'a pas fourni de vraie valeur.
         pv = msg.profile_velocity
         pa = msg.profile_acceleration
-
         pv_valid = (not math.isnan(pv)) and (pv > 0)
         pa_valid = (not math.isnan(pa)) and (pa > 0)
-
         if pv_valid or pa_valid:
             v = pv if pv_valid else servo.state.profile_velocity
             a = pa if pa_valid else servo.state.profile_acceleration
-            self.get_logger().debug(
-                f"[DXL] S{sid} set_profile vel={v:.1f}rpm/s accel={a:.1f}rpm/s²")
             servo.set_profile(v=v, a=a)
 
         # ── 3. Couple ─────────────────────────────────────────────
-        # Appliquer APRÈS le mode et le profil pour que l'ESP32
-        # initialise rampSP dans la bonne unité.
         if msg.torque_enable == 1:
             servo.enable_torque()
         elif msg.torque_enable == 0:
             servo.disable_torque()
 
         # ── 4. Consigne de mouvement ──────────────────────────────
-        # Utiliser le mode courant (après changement éventuel)
         mode = servo.state.operating_mode
 
         if mode == Mode.VELOCITY:
-            # [FIX I] msg.goal_velocity est en RPM → servo.velocity() l'accepte
-            if not math.isnan(msg.goal_velocity):
+            # [4M-A] Moteur A
+            rpm_a = msg.goal_velocity
+            if not math.isnan(rpm_a):
+                servo.velocity(rpm_a)
                 self.get_logger().debug(
-                    f"[DXL] S{sid} goal_velocity={msg.goal_velocity:.1f} rpm")
-                servo.velocity(msg.goal_velocity)
+                    f"[DXL] S{sid} motorA={rpm_a:+.1f}rpm")
+
+            # [4M-A] Moteur B — si NaN → miroir moteur A
+            rpm_b = msg.goal_velocity_b
+            if math.isnan(rpm_b):
+                rpm_b = rpm_a   # comportement par défaut : miroir A→B
+            if not math.isnan(rpm_b):
+                servo.velocity_b(rpm_b)
+                self.get_logger().debug(
+                    f"[DXL] S{sid} motorB={rpm_b:+.1f}rpm")
 
         elif mode in (Mode.POSITION, Mode.EXT_POSITION):
             if not math.isnan(msg.goal_position):
@@ -227,7 +200,8 @@ class DynamixelNode(Node):
 
         elif mode == Mode.CURR_POSITION:
             if not math.isnan(msg.goal_position):
-                ma = msg.goal_current if not math.isnan(msg.goal_current) else 500.0
+                ma = msg.goal_current if not math.isnan(
+                    msg.goal_current) else 500.0
                 servo.move_to_with_current(msg.goal_position, max_ma=ma)
 
         elif mode == Mode.PWM:
@@ -238,15 +212,13 @@ class DynamixelNode(Node):
             self.get_logger().warn(f"[DXL] S{sid} mode inconnu: {mode}")
 
     def _broadcast_callback(self, msg: DynamixelCommand):
-        """Commande broadcast: appliquée à tous les servos."""
         for sid in self.servo_objs:
             self._cmd_callback(msg, sid)
 
     # ─────────────────────────────────────────────────────────────────
     # SERVICES
     # ─────────────────────────────────────────────────────────────────
-    def _srv_torque(self, req: SetBool.Request,
-                    res: SetBool.Response, sid: int) -> SetBool.Response:
+    def _srv_torque(self, req, res, sid):
         servo = self.servo_objs.get(sid)
         if servo is None:
             res.success = False
@@ -254,28 +226,28 @@ class DynamixelNode(Node):
             return res
         ok = servo.enable_torque() if req.data else servo.disable_torque()
         res.success = ok
-        res.message = f"S{sid} torque={'ON' if req.data else 'OFF'} {'OK' if ok else 'ERR'}"
+        res.message = (f"S{sid} torque="
+                       f"{'ON' if req.data else 'OFF'} "
+                       f"{'OK' if ok else 'ERR'}")
         self.get_logger().info(res.message)
         return res
 
-    def _srv_estop_single(self, req: Trigger.Request,
-                           res: Trigger.Response, sid: int) -> Trigger.Response:
+    def _srv_estop_single(self, req, res, sid):
         self.bus.emergency_stop([sid])
         res.success = True
-        res.message = f"S{sid} arrêt d'urgence — couple coupé"
+        res.message = f"S{sid} arrêt d'urgence"
         self.get_logger().warn(res.message)
         return res
 
-    def _srv_estop_all(self, req: Trigger.Request,
-                        res: Trigger.Response) -> Trigger.Response:
+    def _srv_estop_all(self, req, res):
         self.bus.emergency_stop()
         res.success = True
-        res.message = "ARRÊT D'URGENCE — couple coupé sur tous les servos"
+        res.message = "ARRÊT D'URGENCE — tous servos"
         self.get_logger().error(res.message)
         return res
 
     # ─────────────────────────────────────────────────────────────────
-    # PUBLICATION ÉTATS
+    # PUBLICATION ÉTATS — 4 moteurs
     # ─────────────────────────────────────────────────────────────────
     def _publish_states(self):
         now = _ros_time(self)
@@ -287,16 +259,27 @@ class DynamixelNode(Node):
             msg.servo_id            = sid
             msg.operating_mode      = s.operating_mode
             msg.torque_enabled      = s.torque_enabled
+
+            # ── Moteur A (avant) ──────────────────────────────────
             msg.present_position    = float(s.present_position)
-            msg.present_velocity    = float(s.present_velocity)
+            msg.present_velocity    = float(s.present_velocity)    # CT_NOW_VEL (128)
             msg.present_current     = float(s.present_current)
             msg.present_pwm         = float(s.present_pwm)
             msg.present_voltage     = float(s.present_voltage)
             msg.present_temperature = int(s.present_temperature)
+
+            # ── Moteur B (arrière) — [4M-B] ──────────────────────
+            msg.present_velocity_b  = float(s.present_velocity_b)  # CT_NOW_VEL_B (132)
+            msg.present_current_b   = float(getattr(s, 'present_current_b', 0.0))
+
+            # ── Consignes ─────────────────────────────────────────
             msg.goal_position       = float(s.goal_position)
             msg.goal_velocity       = float(s.goal_velocity)
+            msg.goal_velocity_b     = float(getattr(s, 'goal_velocity_b', 0.0))
             msg.goal_current        = float(s.goal_current)
             msg.goal_pwm            = float(s.goal_pwm)
+
+            # ── Santé ─────────────────────────────────────────────
             msg.hardware_error      = int(s.hardware_error)
             msg.is_alive            = s.is_alive()
             msg.push_rate_hz        = float(s.push_rate)
@@ -304,18 +287,14 @@ class DynamixelNode(Node):
             self._pub_state[sid].publish(msg)
 
     # ─────────────────────────────────────────────────────────────────
-    # NETTOYAGE
-    # ─────────────────────────────────────────────────────────────────
     def destroy_node(self):
-        self.get_logger().info("[DXL] Fermeture du nœud…")
+        self.get_logger().info("[DXL] Fermeture…")
         self.ka.stop()
         self.bus.emergency_stop()
         self.bus.close()
         super().destroy_node()
 
 
-# ─────────────────────────────────────────────────────────────────────
-# ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────
 def main(args=None):
     rclpy.init(args=args)
