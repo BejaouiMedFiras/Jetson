@@ -81,8 +81,8 @@ def generate_launch_description():
         # ── cmd_vel → servo RPM bridge ────────────────────────────────
         Node(
             package='dynamixel_motors',
-            executable='cmd_vel_bridge',
-            name='cmd_vel_bridge',
+            executable='diff_drive_controller',
+            name='diff_drive_controller',
         ),
 
         # ── SLAM Toolbox (owns map → odom TF) ─────────────────────────
